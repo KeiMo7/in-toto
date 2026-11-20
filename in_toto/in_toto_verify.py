@@ -186,6 +186,20 @@ for which the public part can be found in the GPG keyring at '~/.gnupg'.
         ),
     )
 
+    parser.add_argument(
+        "--report",
+        dest="report_path",
+        type=str,
+        metavar="<path>",
+        default=None,
+        help=(
+            "path to write a machine-consumable JSON verification report"
+            " (stable schema, see in_toto.reportlib). The same report is"
+            " written for passing and failing verification; a failure to"
+            " write the report does not change the verification result."
+        ),
+    )
+
     verbosity_args = parser.add_mutually_exclusive_group(required=False)
     verbosity_args.add_argument(*VERBOSE_ARGS, **VERBOSE_KWARGS)
     verbosity_args.add_argument(*QUIET_ARGS, **QUIET_KWARGS)
@@ -233,12 +247,47 @@ def main():
                 key = load_public_key_from_file(path)
                 layout_key_dict[key["keyid"]] = key
 
-        verifylib.in_toto_verify(
-            layout,
-            layout_key_dict,
-            args.link_dir,
-            inspect_timeout=args.inspect_timeout,
-        )
+        if args.report_path is None:
+            # Legacy behavior: exceptions are raised at the original points.
+            verifylib.in_toto_verify(
+                layout,
+                layout_key_dict,
+                args.link_dir,
+                inspect_timeout=args.inspect_timeout,
+            )
+        else:
+            # Report mode: never raises on verification failures; the report
+            # carries every attributed finding with a closed category.
+            _, report = verifylib.in_toto_verify_with_report(
+                layout,
+                layout_key_dict,
+                args.link_dir,
+                inspect_timeout=args.inspect_timeout,
+            )
+            # Writing the report must not affect the verification conclusion.
+            try:
+                with open(args.report_path, "w", encoding="utf8") as fp:
+                    fp.write(report.to_json())
+            except OSError as e:
+                LOG.error(
+                    "(in-toto-verify) Failed to write report to '%s': %s",
+                    args.report_path,
+                    e,
+                )
+            if report.result == "failed":
+                # Keep the human-readable log behavior of the legacy path:
+                # one line per attributed failure, built from report fields
+                # (no report text is parsed back).
+                for finding in report.to_dict()["findings"]:
+                    LOG.error(
+                        "(in-toto-verify) verification failure [%s]"
+                        " stage='%s' item='%s': %s",
+                        finding["category"],
+                        finding["stage"],
+                        finding.get("item_name") or "-",
+                        finding["message"],
+                    )
+                sys.exit(1)
 
     except Exception as e:  # noqa: BLE001
         LOG.error("(in-toto-verify) %s: %s", type(e).__name__, e)

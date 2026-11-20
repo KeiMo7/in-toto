@@ -39,6 +39,7 @@ from securesystemslib._gpg.exceptions import KeyExpirationError
 import in_toto.formats
 import in_toto.models.layout
 import in_toto.models.link
+import in_toto.reportlib
 import in_toto.rulelib
 import in_toto.runlib
 import in_toto.settings
@@ -51,6 +52,15 @@ from in_toto.exceptions import (
 )
 from in_toto.formats import _check_parameter_dict, _check_public_keys
 from in_toto.models.metadata import Metadata
+from in_toto.reportlib import (
+    _ACTIVE_REPORT,
+    ARTIFACT_TYPES,
+    CATEGORIES,
+    ITEM_TYPES,
+    STAGES,
+    VerificationFinding,
+    VerificationReport,
+)
 
 # Inherits from in_toto base logger (c.f. in_toto.log)
 LOG = logging.getLogger(__name__)
@@ -58,7 +68,27 @@ LOG = logging.getLogger(__name__)
 RULE_TRACE = {}
 
 
-def _raise_on_bad_retval(return_value, command=None):
+def _report():
+    """Return the active VerificationReport or None (legacy behavior)."""
+    return _ACTIVE_REPORT.get()
+
+
+def _record_finding(finding):
+    """Hand a finding to the active report, if any.
+
+    Attribution construction must never break verification itself: any error
+    while recording degrades to a report error instead of propagating.
+    """
+    report = _report()
+    if report is None:
+        return
+    try:
+        report.add_finding(finding)
+    except Exception as e:  # noqa: BLE001
+        report.record_report_error(finding.stage, e)
+
+
+def _raise_on_bad_retval(return_value, command=None, inspection_name=None):
     """
     <Purpose>
       Internal function that checks return values of shell commands, e.g. from
@@ -70,6 +100,9 @@ def _raise_on_bad_retval(return_value, command=None):
       command: (optional)
               The command whose execution returned the value, used for exception
               message.
+      inspection_name: (optional)
+              The name of the inspection the command belongs to, used for the
+              structured verification report.
 
     <Exceptions>
       BadReturnValueError if the return_value is non-int and non-zero
@@ -88,13 +121,39 @@ def _raise_on_bad_retval(return_value, command=None):
         msg = f"{msg}."
 
     if not isinstance(return_value, int):
-        raise BadReturnValueError(msg.format(what="int"))
+        exc = BadReturnValueError(msg.format(what="int"))
+        _bad_retval_finding(exc, return_value, command, "int", inspection_name)
+        raise exc
 
     # TODO: in-toto specification suggests special behavior on
     # return_value == 127, but does not fully define that behavior yet
 
     if return_value != 0:
-        raise BadReturnValueError(msg.format(what="zero"))
+        exc = BadReturnValueError(msg.format(what="zero"))
+        _bad_retval_finding(exc, return_value, command, "zero", inspection_name)
+        raise exc
+
+
+def _bad_retval_finding(
+    exc, return_value, command, expected_type, inspection_name=None
+):
+    """Record the command-return-value failure in the active report, if any."""
+    if _report() is None:
+        return
+    message = str(exc)
+    if inspection_name:
+        message = f"Inspection '{inspection_name}': {message}"
+    finding = VerificationFinding(
+        category=CATEGORIES.COMMAND_RETURN_VALUE,
+        stage=STAGES.INSPECTION_EXECUTION,
+        message=message,
+        item_type=ITEM_TYPES.INSPECTION,
+        item_name=inspection_name,
+        expected={"return_value": 0, "return_type": expected_type},
+        actual={"return_value": return_value},
+        detail={"command": command},
+    )
+    _record_finding(finding)
 
 
 def load_links_for_layout(layout, link_dir_path):
@@ -165,10 +224,41 @@ def load_links_for_layout(layout, link_dir_path):
         # filenames, to fail early. A more thorough signature-based threshold
         # check is indispensable.
         if len(links_per_step) < step.threshold:
-            raise in_toto.exceptions.LinkNotFoundError(
+            missing_keyids = sorted(
+                set(step.pubkeys) - set(links_per_step.keys())
+            )
+            exc = in_toto.exceptions.LinkNotFoundError(
                 f"Step '{step.name}' requires '{step.threshold}'"
                 f" link metadata file(s), found '{len(links_per_step)}'."
             )
+            if _report() is not None:
+                _record_finding(
+                    VerificationFinding(
+                        category=CATEGORIES.MATERIAL_MISSING,
+                        stage=STAGES.LINK_LOADING,
+                        message=str(exc),
+                        item_type=ITEM_TYPES.STEP,
+                        item_name=step.name,
+                        expected={
+                            "link_count": step.threshold,
+                        },
+                        actual={
+                            "link_count": len(links_per_step),
+                            "available_signer_keyids": sorted(
+                                links_per_step.keys()
+                            ),
+                        },
+                        detail={
+                            "missing_signer_keyids": missing_keyids,
+                            "authorized_keyids": sorted(step.pubkeys),
+                        },
+                    )
+                )
+                # In report mode keep the (partial) links for this step so
+                # later stages can still attribute rule failures against it;
+                # the missing-material finding is already recorded.
+            else:
+                raise exc
 
         steps_metadata[step.name] = links_per_step
 
@@ -229,17 +319,29 @@ def run_all_inspections(
         # If so, we should probably make it a default in run_link
         # We could use artifact rule paths.
         material_list = product_list = ["."]
-        link = in_toto.runlib.in_toto_run(
-            inspection.name,
-            material_list,
-            product_list,
-            inspection.run,
-            timeout=timeout,
-        )
+        try:
+            link = in_toto.runlib.in_toto_run(
+                inspection.name,
+                material_list,
+                product_list,
+                inspection.run,
+                timeout=timeout,
+            )
 
-        _raise_on_bad_retval(
-            link.signed.byproducts.get("return-value"), inspection.run
-        )
+            _raise_on_bad_retval(
+                link.signed.byproducts.get("return-value"),
+                inspection.run,
+                inspection_name=inspection.name,
+            )
+        except BadReturnValueError:
+            # Legacy mode: _raise_on_bad_retval already raised at the original
+            # point. Report mode: the finding was recorded at the source, keep
+            # collecting the remaining inspections' failures.
+            if _report() is None:
+                raise
+            continue
+        finally:
+            in_toto.settings.ARTIFACT_BASE_PATH = base_path_backup
 
         inspection_links_dict[inspection.name] = link.signed
 
@@ -251,8 +353,6 @@ def run_all_inspections(
                 step_name=inspection.name
             )
             link.dump(filename)
-
-        in_toto.settings.ARTIFACT_BASE_PATH = base_path_backup
 
     return inspection_links_dict
 
@@ -544,11 +644,42 @@ def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR
         # different dictionary keys, e.g. {keyid1: KEY1, keyid2: KEY1}
         # Maybe we should add such a check to the layout validation? Or here?
         if valid_authorized_links_cnt < step.threshold:
-            raise ThresholdVerificationError(
+            exc = ThresholdVerificationError(
                 f"Step '{step.name}' requires at least '{step.threshold}' links"
                 " validly signed by different authorized functionaries. Only"
                 f" found '{valid_authorized_links_cnt}'"
             )
+            if _report() is not None:
+                # Functionaries that could still provide a valid signature:
+                # authorized main keys without a counted valid link.
+                present_main_keyids = set(used_main_keyids)
+                missing_keyids = sorted(set(step.pubkeys) - present_main_keyids)
+                _record_finding(
+                    VerificationFinding(
+                        category=CATEGORIES.SIGNATURE_THRESHOLD,
+                        stage=STAGES.LINK_SIGNATURE_THRESHOLDS,
+                        message=str(exc),
+                        item_type=ITEM_TYPES.STEP,
+                        item_name=step.name,
+                        expected={"valid_signer_count": step.threshold},
+                        actual={
+                            "valid_signer_count": valid_authorized_links_cnt,
+                            "valid_signer_keyids": sorted(present_main_keyids),
+                        },
+                        detail={
+                            "missing_signer_keyids": missing_keyids,
+                            "authorized_keyids": sorted(step.pubkeys),
+                            "observed_link_keyids": sorted(
+                                steps_metadata.get(step.name, {}).keys()
+                            ),
+                        },
+                    )
+                )
+                # In report mode retain the partial valid links so later
+                # stages still have an entry for this step; the threshold
+                # finding above already marks the failure.
+            else:
+                raise exc
 
         # Add all good links of this step to the dictionary of links of all steps
         verified_steps_metadata[step.name] = verified_key_link_dict
@@ -988,7 +1119,12 @@ def _get_artifact_rule_traceback():
     """Build and return string form global `RULE_TRACE` which may be used as
     error message for RuleVerificationError.
 
+    Returns an empty string if the global rule trace has not been initialized,
+    so that low-level rule functions can also be called standalone.
     """
+    if not RULE_TRACE:
+        return ""
+
     traceback_str = "Full trace for 'expected_{}' of item '{}':\n".format(
         RULE_TRACE["source_type"], RULE_TRACE["source_name"]
     )
@@ -1011,7 +1147,14 @@ def _get_artifact_rule_traceback():
     return traceback_str
 
 
-def verify_item_rules(source_name, source_type, rules, links):
+def verify_item_rules(  # noqa: PLR0913
+    source_name,
+    source_type,
+    rules,
+    links,
+    item_type=ITEM_TYPES.UNKNOWN,
+    item_path=None,
+):
     """
     <Purpose>
       Apply all passed material or product rules (see source_type) of a given
@@ -1073,6 +1216,35 @@ def verify_item_rules(source_name, source_type, rules, links):
             f"one of 'materials' or 'products'. Got: '{source_type}'"
         )
 
+    # In report mode an upstream stage (missing link or failed inspection) may
+    # have left the item without a link. Its failure is already recorded, so
+    # skip rule processing for this item instead of crashing the pipeline.
+    if source_name not in links:
+        if _report() is not None:
+            _record_finding(
+                VerificationFinding(
+                    category=CATEGORIES.MATERIAL_MISSING,
+                    stage=(
+                        STAGES.STEP_RULES
+                        if item_type == ITEM_TYPES.STEP
+                        else STAGES.INSPECTION_RULES
+                    ),
+                    message=(
+                        f"No link available for item '{source_name}',"
+                        " artifact rules could not be evaluated"
+                    ),
+                    item_type=item_type,
+                    item_name=source_name,
+                    item_path=item_path,
+                    artifact_type=source_type,
+                    expected={"link_available": True},
+                    actual={"link_available": False},
+                    detail={"reason": "link_unavailable"},
+                )
+            )
+            return
+        raise KeyError(source_name)
+
     # Create shortcuts to item's materials and products (including hashes),
     # required to verify "modify" and "match" rules.
     materials_dict = links[source_name].materials
@@ -1092,12 +1264,14 @@ def verify_item_rules(source_name, source_type, rules, links):
     RULE_TRACE.clear()
     RULE_TRACE["source_name"] = source_name
     RULE_TRACE["source_type"] = source_type
-    RULE_TRACE["materials"] = list(materials_dict)
-    RULE_TRACE["products"] = list(products_dict)
+    RULE_TRACE["materials"] = sorted(materials_dict)
+    RULE_TRACE["products"] = sorted(products_dict)
     RULE_TRACE["trace"] = []
+    RULE_TRACE["item_type"] = item_type
+    RULE_TRACE["item_path"] = item_path
 
     # Process rules and remove consumed items from queue in each iteration
-    for rule in rules:
+    for rule_index, rule in enumerate(rules):
         LOG.info("Verifying '%s'...", " ".join(rule))
 
         # Parse the rule and create two shortcuts to contained rule data
@@ -1105,52 +1279,177 @@ def verify_item_rules(source_name, source_type, rules, links):
         _type = rule_data["rule_type"]
         pattern = rule_data["pattern"]
 
-        # Initialize empty consumed set as fallback for rules that do not consume
-        # artifacts. All rules except "disallow" and "require" consume artifacts.
-        consumed = set()
-
-        if _type == "match":
-            consumed = verify_match_rule(
-                rule_data, artifacts_queue, artifacts, links
+        try:
+            consumed = _apply_single_rule(
+                rule_data,
+                artifacts_queue,
+                artifacts,
+                links,
+                materials_dict,
+                products_dict,
+                materials_paths,
+                products_paths,
             )
+        except RuleVerificationError as exc:
+            if _report() is None:
+                raise
 
-        elif _type == "create":
-            consumed = verify_create_rule(
-                pattern, artifacts_queue, materials_paths, products_paths
+            # Same-source structured attribution: the decision was made in the
+            # rule function; here we only capture its context. No log/error
+            # text parsing is involved.
+            _record_rule_failure(
+                exc,
+                source_name=source_name,
+                source_type=source_type,
+                rule=rule,
+                rule_type=_type,
+                rule_index=rule_index,
+                pattern=pattern,
+                artifacts_queue=artifacts_queue,
             )
-
-        elif _type == "delete":
-            consumed = verify_delete_rule(
-                pattern, artifacts_queue, materials_paths, products_paths
+            # A failed disallow/require rule does not consume anything;
+            # continue with the remaining rules to collect every failure.
+            RULE_TRACE["trace"].append(
+                {"rule": rule, "queue": sorted(artifacts_queue)}
             )
-
-        elif _type == "modify":
-            consumed = verify_modify_rule(
-                pattern, artifacts_queue, materials_dict, products_dict
-            )
-
-        elif _type == "allow":
-            consumed = verify_allow_rule(pattern, artifacts_queue)
-
-        # It's up to the "disallow" and "require" rule to raise an error if
-        # artifacts were not consumed as intended
-        elif _type == "disallow":
-            verify_disallow_rule(pattern, artifacts_queue)
-
-        elif _type == "require":
-            verify_require_rule(pattern, artifacts_queue)
-
-        else:  # pragma: no cover (unreachable)
-            raise securesystemslib.exceptions.FormatError(
-                f"Invaldid rule type '{_type}'."
-            )
+            continue
 
         artifacts_queue -= consumed
 
         # Append rule and copy of queue to global info for a rich error message
         RULE_TRACE["trace"].append(
-            {"rule": rule, "queue": list(artifacts_queue)}
+            {"rule": rule, "queue": sorted(artifacts_queue)}
         )
+
+
+def _apply_single_rule(  # noqa: PLR0913, PLR0911
+    rule_data,
+    artifacts_queue,
+    artifacts,
+    links,
+    materials_dict,
+    products_dict,
+    materials_paths,
+    products_paths,
+):
+    """Execute one parsed artifact rule and return the artifacts it consumed."""
+    _type = rule_data["rule_type"]
+    pattern = rule_data["pattern"]
+
+    # Initialize empty consumed set as fallback for rules that do not consume
+    # artifacts. All rules except "disallow" and "require" consume artifacts.
+    if _type == "match":
+        return verify_match_rule(rule_data, artifacts_queue, artifacts, links)
+
+    if _type == "create":
+        return verify_create_rule(
+            pattern, artifacts_queue, materials_paths, products_paths
+        )
+
+    if _type == "delete":
+        return verify_delete_rule(
+            pattern, artifacts_queue, materials_paths, products_paths
+        )
+
+    if _type == "modify":
+        return verify_modify_rule(
+            pattern, artifacts_queue, materials_dict, products_dict
+        )
+
+    if _type == "allow":
+        return verify_allow_rule(pattern, artifacts_queue)
+
+    # It's up to the "disallow" and "require" rule to raise an error if
+    # artifacts were not consumed as intended
+    if _type == "disallow":
+        verify_disallow_rule(pattern, artifacts_queue)
+        return set()
+
+    if _type == "require":
+        verify_require_rule(pattern, artifacts_queue)
+        return set()
+
+    # pragma: no cover (unreachable)
+    raise securesystemslib.exceptions.FormatError(
+        f"Invaldid rule type '{_type}'."
+    )
+
+
+def _record_rule_failure(  # noqa: PLR0913
+    exc,
+    source_name,
+    source_type,
+    rule,
+    rule_type,
+    rule_index,
+    pattern,
+    artifacts_queue,
+):
+    """Turn a rule verification decision into a structured finding.
+
+    The expected/actual pair is built from the same data the rule functions
+    evaluated against (the artifact queue), not from the exception text.
+    """
+    queue_sorted = sorted(artifacts_queue)
+    item = _report_item_for()
+
+    if rule_type == "disallow":
+        matched = sorted(fnmatch.filter(artifacts_queue, pattern))
+        expected = {
+            "rule": rule,
+            "matched_artifacts": [],
+        }
+        actual = {
+            "rule": rule,
+            "matched_artifacts": matched,
+        }
+    elif rule_type == "require":
+        expected = {
+            "rule": rule,
+            "required_artifact": pattern,
+            "present": True,
+        }
+        actual = {
+            "rule": rule,
+            "required_artifact": pattern,
+            "present": pattern in artifacts_queue,
+        }
+    else:  # pragma: no cover - only disallow/require raise today
+        expected = {"rule": rule}
+        actual = {"rule": rule, "queue": queue_sorted}
+
+    finding = VerificationFinding(
+        category=CATEGORIES.RULE_FAILURE,
+        stage=(
+            STAGES.STEP_RULES
+            if item.get("item_type") == ITEM_TYPES.STEP
+            else STAGES.INSPECTION_RULES
+        ),
+        message=str(exc).split("\n", 1)[0],
+        item_type=item.get("item_type", ITEM_TYPES.UNKNOWN),
+        item_name=source_name,
+        item_path=item.get("item_path"),
+        artifact_type=source_type,
+        rule=rule,
+        rule_type=rule_type,
+        rule_index=rule_index,
+        expected=expected,
+        actual=actual,
+        detail={
+            "pattern": pattern,
+            "remaining_artifacts_after_rule": queue_sorted,
+        },
+    )
+    _record_finding(finding)
+
+
+def _report_item_for():
+    """Look up whether a verified item is a step or an inspection."""
+    # The item kind is tracked by the caller via the active report's stage
+    # context; verify_all_item_rules passes it explicitly through RULE_TRACE.
+    item_type = RULE_TRACE.get("item_type", ITEM_TYPES.UNKNOWN)
+    item_path = RULE_TRACE.get("item_path")
+    return {"item_type": item_type, "item_path": item_path}
 
 
 def verify_all_item_rules(items, links):
@@ -1178,13 +1477,42 @@ def verify_all_item_rules(items, links):
 
     """
     for item in items:
-        LOG.info("Verifying material rules for '%s'...", item.name)
-        verify_item_rules(
-            item.name, "materials", item.expected_materials, links
+        item_type = (
+            ITEM_TYPES.STEP
+            if getattr(item, "_type", "") == "step"
+            else ITEM_TYPES.INSPECTION
         )
+        item_path = RULE_TRACE.get("item_path")
+
+        LOG.info("Verifying material rules for '%s'...", item.name)
+        try:
+            verify_item_rules(
+                item.name,
+                ARTIFACT_TYPES.MATERIALS,
+                item.expected_materials,
+                links,
+                item_type=item_type,
+                item_path=item_path,
+            )
+        except RuleVerificationError:
+            if _report() is None:
+                raise
+            # The finding was recorded at the rule decision point. In report
+            # mode continue with the product rules to surface every failure.
 
         LOG.info("Verifying product rules for '%s'...", item.name)
-        verify_item_rules(item.name, "products", item.expected_products, links)
+        try:
+            verify_item_rules(
+                item.name,
+                ARTIFACT_TYPES.PRODUCTS,
+                item.expected_products,
+                links,
+                item_type=item_type,
+                item_path=item_path,
+            )
+        except RuleVerificationError:
+            if _report() is None:
+                raise
 
 
 def verify_threshold_constraints(layout, chain_link_dict):
@@ -1243,15 +1571,40 @@ def verify_threshold_constraints(layout, chain_link_dict):
             step.threshold,
         )
         # Extract the key_link_dict for this step from the passed chain_link_dict
-        key_link_dict = chain_link_dict[step.name]
+        # In report mode a step whose links could not be loaded/verified was
+        # already recorded upstream; skip it instead of crashing the pipeline.
+        key_link_dict = chain_link_dict.get(step.name)
+        if not key_link_dict:
+            continue
 
         # Check if we have at least <threshold> links for this step
         # NOTE: This is already done in `verify_link_signature_thresholds`,
         # Should we remove the check?
         if len(key_link_dict) < step.threshold:
-            raise ThresholdVerificationError(
+            exc = ThresholdVerificationError(
                 f"Step '{step.name}' not performed by enough functionaries!"
             )
+            if _report() is not None:
+                missing_keyids = sorted(
+                    set(step.pubkeys) - set(key_link_dict.keys())
+                )
+                _record_finding(
+                    VerificationFinding(
+                        category=CATEGORIES.SIGNATURE_THRESHOLD,
+                        stage=STAGES.THRESHOLD_CONSTRAINTS,
+                        message=str(exc),
+                        item_type=ITEM_TYPES.STEP,
+                        item_name=step.name,
+                        expected={"link_count": step.threshold},
+                        actual={
+                            "link_count": len(key_link_dict),
+                            "signer_keyids": sorted(key_link_dict.keys()),
+                        },
+                        detail={"missing_signer_keyids": missing_keyids},
+                    )
+                )
+                continue
+            raise exc
 
         # Take a reference link (e.g. the first in the step_link_dict)
         reference_keyid = next(iter(key_link_dict.keys()))
@@ -1265,7 +1618,7 @@ def verify_threshold_constraints(layout, chain_link_dict):
                 reference_link.materials != link.materials
                 or reference_link.products != link.products
             ):
-                raise ThresholdVerificationError(
+                exc = ThresholdVerificationError(
                     "Links '{}' and '{}' have different artifacts!".format(
                         in_toto.models.link.FILENAME_FORMAT.format(
                             step_name=step.name, keyid=reference_keyid
@@ -1275,6 +1628,43 @@ def verify_threshold_constraints(layout, chain_link_dict):
                         ),
                     )
                 )
+                if _report() is not None:
+                    _record_finding(
+                        VerificationFinding(
+                            category=CATEGORIES.SIGNATURE_THRESHOLD,
+                            stage=STAGES.THRESHOLD_CONSTRAINTS,
+                            message=str(exc),
+                            item_type=ITEM_TYPES.STEP,
+                            item_name=step.name,
+                            expected={
+                                "agreeing_signer_keyids": [
+                                    reference_keyid,
+                                    keyid,
+                                ],
+                            },
+                            actual={
+                                "reference_keyid": reference_keyid,
+                                "diverging_keyid": keyid,
+                                "reference_material_paths": sorted(
+                                    reference_link.materials.keys()
+                                ),
+                                "diverging_material_paths": sorted(
+                                    link.materials.keys()
+                                ),
+                                "reference_product_paths": sorted(
+                                    reference_link.products.keys()
+                                ),
+                                "diverging_product_paths": sorted(
+                                    link.products.keys()
+                                ),
+                            },
+                            detail={
+                                "reason": "artifact_mismatch",
+                            },
+                        )
+                    )
+                    break
+                raise exc
 
 
 def reduce_chain_links(chain_link_dict):
@@ -1315,8 +1705,12 @@ def reduce_chain_links(chain_link_dict):
     reduced_chain_link_dict = {}
 
     for step_name, key_link_dict in chain_link_dict.items():
+        # In report mode a step with no usable link is already attributed
+        # upstream; omit it instead of raising StopIteration on an empty dict.
+        if not key_link_dict and _report() is not None:
+            continue
         # Extract the key_link_dict for this step from the passed chain_link_dict
-        # take one exemplary link (e.g. the first in the step_link_dict)
+        # take one exemplary link (e.g. first in the step_link_dict)
         # form the reduced_chain_link_dict to return
         reduced_chain_link_dict[step_name] = next(iter(key_link_dict.values()))
 
@@ -1405,15 +1799,27 @@ def verify_sublayouts(
                     superlayout_link_dir_path, sub_link_dir
                 )
 
-                # Make a recursive call to in_toto_verify with the
-                # layout and the extracted key object
-                summary_link = in_toto_verify(
-                    metadata,
-                    layout_key_dict,
-                    link_dir_path=sublayout_link_dir_path,
-                    step_name=step_name,
-                    inspect_timeout=inspect_timeout,
-                )
+                if _report() is None:
+                    # Make a recursive call to in_toto_verify with the
+                    # layout and the extracted key object
+                    summary_link = in_toto_verify(
+                        metadata,
+                        layout_key_dict,
+                        link_dir_path=sublayout_link_dir_path,
+                        step_name=step_name,
+                        inspect_timeout=inspect_timeout,
+                    )
+                else:
+                    # Recurse with a fresh sub-report and merge the inner
+                    # failures under the outer step's full path.
+                    summary_link, sub_report = in_toto_verify_with_report(
+                        metadata,
+                        layout_key_dict,
+                        link_dir_path=sublayout_link_dir_path,
+                        step_name=step_name,
+                        inspect_timeout=inspect_timeout,
+                    )
+                    _report().merge_sublayout(step_name, sub_report)
 
                 # Replace the layout object with the link object returned
                 # by in-toto-verify
@@ -1468,8 +1874,22 @@ def get_summary_link(layout, reduced_chain_link_dict, name):
     # Take first and last link in the order the corresponding
     # steps appear in the layout, if there are any.
     if len(layout.steps) > 0:
-        first_step_link = reduced_chain_link_dict[layout.steps[0].name]
-        last_step_link = reduced_chain_link_dict[layout.steps[-1].name]
+        # In report mode a step with no usable link is already attributed
+        # upstream; fall back to the next available link instead of crashing.
+        if _report() is not None:
+            available = [
+                reduced_chain_link_dict[step.name]
+                for step in layout.steps
+                if step.name in reduced_chain_link_dict
+            ]
+            if not available:
+                summary_link.name = name
+                return summary_link
+            first_step_link = available[0]
+            last_step_link = available[-1]
+        else:
+            first_step_link = reduced_chain_link_dict[layout.steps[0].name]
+            last_step_link = reduced_chain_link_dict[layout.steps[-1].name]
 
         summary_link.materials = first_step_link.materials
         summary_link.name = name
@@ -1579,9 +1999,110 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
       verification.
 
     """
+    # Legacy entry point: no active report, exceptions are raised at the
+    # original points and with the original types and messages.
+    token = _ACTIVE_REPORT.set(None)
+    try:
+        summary_link, _ = _in_toto_verify_impl(
+            metadata,
+            layout_key_dict,
+            link_dir_path,
+            substitution_parameters,
+            step_name,
+            persist_inspection_links,
+            inspect_timeout,
+            report=None,
+        )
+    finally:
+        _ACTIVE_REPORT.reset(token)
+    return summary_link
+
+
+def in_toto_verify_with_report(  # noqa: PLR0913
+    metadata,
+    layout_key_dict,
+    link_dir_path=".",
+    substitution_parameters=None,
+    step_name="",
+    persist_inspection_links=True,
+    inspect_timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
+):
+    """Run verification and return a machine-consumable
+    :class:`~in_toto.reportlib.VerificationReport` alongside the summary link.
+
+    The verification decisions are the exact same ones made by
+    :func:`in_toto_verify`; the report is produced at the decision points
+    themselves instead of being reconstructed from logs or exception text.
+
+    Unlike :func:`in_toto_verify`, this routine does not raise on the first
+    failure: it continues the pipeline where meaningful and records one
+    :class:`~in_toto.reportlib.VerificationFinding` per attributed failure, so
+    that all failures of one verification run are available in a single
+    report. A passing verification returns a homogeneous report with an empty
+    ``findings`` list and ``result == "passed"``.
+
+    Returns:
+      A tuple ``(summary_link, report)``. ``summary_link`` is ``None`` if the
+      verification failed before a summary link could be built.
+    """
+    report = VerificationReport()
+    token = _ACTIVE_REPORT.set(report)
+    try:
+        summary_link, report = _in_toto_verify_impl(
+            metadata,
+            layout_key_dict,
+            link_dir_path,
+            substitution_parameters,
+            step_name,
+            persist_inspection_links,
+            inspect_timeout,
+            report=report,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Safety net: if the detailed attribution itself blows up, degrade to
+        # the minimal "which stage failed" conclusion and preserve the original
+        # error chain, instead of dropping the whole report.
+        stage = STAGES.SUBLAYOUT if step_name else STAGES.UNKNOWN
+        try:
+            report.record_failure(stage, exc)
+        except Exception as inner_exc:  # noqa: BLE001
+            report.record_report_error(stage, inner_exc)
+        summary_link = None
+    finally:
+        _ACTIVE_REPORT.reset(token)
+    return summary_link, report
+
+
+def _in_toto_verify_impl(  # noqa: PLR0913, PLR0915
+    metadata,
+    layout_key_dict,
+    link_dir_path,
+    substitution_parameters,
+    step_name,
+    persist_inspection_links,
+    inspect_timeout,
+    report,
+):
+    """Shared verification kernel used by both the legacy and report entries."""
+
+    def handle_stage_failure(stage, exc):
+        """Legacy mode re-raises immediately; report mode records and continues
+        when the stage is recoverable. Unrecoverable stages re-raise as well,
+        after recording the minimal stage conclusion."""
+        if report is None:
+            raise exc
+        report.record_failure(stage, exc)
+        return exc
 
     LOG.info("Verifying layout metadata signatures...")
-    verify_metadata_signatures(metadata, layout_key_dict)
+    try:
+        verify_metadata_signatures(metadata, layout_key_dict)
+    except SignatureVerificationError as exc:
+        handle_stage_failure(STAGES.LAYOUT_SIGNATURES, exc)
+        # Without a trustworthy layout no subsequent decision is meaningful.
+        if report is not None:
+            return None, report
+        raise  # pragma: no cover - legacy mode raises above
 
     # For the rest of the verification we only care about the layout payload
     # (Layout) that carries all the information and not about the layout
@@ -1590,12 +2111,24 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     layout = metadata.get_payload()
 
     LOG.info("Verifying layout expiration...")
-    verify_layout_expiration(layout)
+    try:
+        verify_layout_expiration(layout)
+    except LayoutExpiredError as exc:
+        handle_stage_failure(STAGES.LAYOUT_EXPIRATION, exc)
+        if report is not None:
+            return None, report
+        raise  # pragma: no cover
 
     # If there are parameters sent to the translation layer, substitute them
     if substitution_parameters is not None:
         LOG.info("Performing parameter substitution...")
-        substitute_parameters(layout, substitution_parameters)
+        try:
+            substitute_parameters(layout, substitution_parameters)
+        except Exception as exc:
+            handle_stage_failure(STAGES.PARAMETER_SUBSTITUTION, exc)
+            if report is not None:
+                return None, report
+            raise
 
     LOG.info("Reading link metadata files...")
     steps_metadata = load_links_for_layout(layout, link_dir_path)
@@ -1639,4 +2172,5 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     # Return a link file which summarizes the entire software supply chain
     # This is mostly relevant if the currently verified supply chain is embedded
     # in another supply chain
-    return get_summary_link(layout, reduced_chain_link_dict, step_name)
+    summary_link = get_summary_link(layout, reduced_chain_link_dict, step_name)
+    return summary_link, report
