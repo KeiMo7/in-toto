@@ -133,18 +133,20 @@ class TestInTotoRunTool(CliTestCase, TmpDirMixin, GPGKeysMixin):
         args4 = named_args + ["--base-path", "bogus/path"] + positional_args
         self.assert_cli_sys_exit(args4, 1)
 
-        # Test with lstrip path
+        # Test with lstrip path. Prefix stripping only applies at path
+        # segment boundaries: a prefix that is not a complete leading
+        # segment must not strip a partial name (see in_toto.path).
         strip_prefix = self.test_artifact[:-1]
         args5 = named_args + ["--lstrip-paths", strip_prefix] + positional_args
         self.assert_cli_sys_exit(args5, 0)
         link_metadata = Metablock.load(self.test_link_rsa)
         self.assertListEqual(
             list(link_metadata.signed.materials.keys()),
-            [self.test_artifact[len(strip_prefix) :]],
+            [self.test_artifact],
         )
         self.assertListEqual(
             list(link_metadata.signed.products.keys()),
-            [self.test_artifact[len(strip_prefix) :]],
+            [self.test_artifact],
         )
 
     def test_main_with_metadata_directory(self):
@@ -401,18 +403,20 @@ class TestInTotoRunToolWithDSSE(CliTestCase, TmpDirMixin, GPGKeysMixin):
         args4 = named_args + ["--base-path", "bogus/path"] + positional_args
         self.assert_cli_sys_exit(args4, 1)
 
-        # Test with lstrip path
+        # Test with lstrip path. Prefix stripping only applies at path
+        # segment boundaries: a prefix that is not a complete leading
+        # segment must not strip a partial name (see in_toto.path).
         strip_prefix = self.test_artifact[:-1]
         args5 = named_args + ["--lstrip-paths", strip_prefix] + positional_args
         self.assert_cli_sys_exit(args5, 0)
         link = Metadata.load(self.test_link_rsa).get_payload()
         self.assertListEqual(
             list(link.materials.keys()),
-            [self.test_artifact[len(strip_prefix) :]],
+            [self.test_artifact],
         )
         self.assertListEqual(
             list(link.products.keys()),
-            [self.test_artifact[len(strip_prefix) :]],
+            [self.test_artifact],
         )
 
     def test_main_with_default_gpg_key(self):

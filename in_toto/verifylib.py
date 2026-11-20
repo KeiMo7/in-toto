@@ -26,7 +26,6 @@
 """
 
 import datetime
-import fnmatch
 import logging
 import os
 
@@ -51,6 +50,12 @@ from in_toto.exceptions import (
 )
 from in_toto.formats import _check_parameter_dict, _check_public_keys
 from in_toto.models.metadata import Metadata
+from in_toto.path import (
+    is_unresolved_hash_dict,
+    normalize_rule_path,
+    path_glob_filter,
+    strip_rule_prefix,
+)
 
 # Inherits from in_toto base logger (c.f. in_toto.log)
 LOG = logging.getLogger(__name__)
@@ -642,6 +647,27 @@ def verify_all_steps_command_alignment(layout, chain_link_dict):
             verify_command_alignment(command, expected_command)
 
 
+def _strip_source_prefix(artifacts_queue, source_prefix):
+    """Filter queued paths by a rule source prefix at segment boundaries and
+    return them with the prefix removed. An empty prefix means no filtering.
+    """
+    if not source_prefix:
+        return list(artifacts_queue)
+    filtered = []
+    for artifact_path in artifacts_queue:
+        stripped = strip_rule_prefix(artifact_path, source_prefix)
+        if stripped is not None:
+            filtered.append(stripped)
+    return filtered
+
+
+def _join_rule_prefix(prefix, path):
+    """Re-join a rule prefix and a globbed path using shared normalization."""
+    if not prefix:
+        return path
+    return normalize_rule_path(os.path.join(prefix, path))
+
+
 def verify_match_rule(rule_data, artifacts_queue, source_artifacts, links):
     """
     <Purpose>
@@ -699,60 +725,48 @@ def verify_match_rule(rule_data, artifacts_queue, source_artifacts, links):
 
     # Filter part 1 - Filter artifacts using optional source prefix, and subtract
     # prefix before filtering with rule pattern (see filter part 2) to prevent
-    # globbing in the prefix.
-    if rule_data["source_prefix"]:
-        # Add trailing slash to source prefix if it does not exist
-        normalized_source_prefix = os.path.join(
-            rule_data["source_prefix"], ""
-        ).replace("\\", "/")
+    # globbing in the prefix. Prefix matching happens at path segment
+    # boundaries and uses the same shared normalization as recording.
+    filtered_source_paths = _strip_source_prefix(
+        artifacts_queue, rule_data["source_prefix"]
+    )
 
-        filtered_source_paths = [
-            artifact_path[len(normalized_source_prefix) :]
-            for artifact_path in artifacts_queue
-            if artifact_path.startswith(normalized_source_prefix)
-        ]
-
-    else:
-        filtered_source_paths = artifacts_queue
-
-    # Filter part 2 - glob above filtered artifact paths
-    filtered_source_paths = fnmatch.filter(
+    # Filter part 2 - glob above filtered artifact paths. The shared matcher
+    # never crosses a directory separator, so a rule limited to a
+    # sub-directory cannot match deeper paths.
+    filtered_source_paths = path_glob_filter(
         filtered_source_paths, rule_data["pattern"]
     )
 
     # Iterate over filtered source paths and try to match the corresponding
     # source artifact hash with the corresponding destination artifact hash
     for path in filtered_source_paths:
-        # If a source prefix was specified, we subtracted the prefix above before
-        # globbing. We have to re-prepend the prefix in order to retrieve the
-        # corresponding source artifact below.
-        if rule_data["source_prefix"]:
-            full_source_path = os.path.join(
-                rule_data["source_prefix"], path
-            ).replace("\\", "/")
-
-        else:
-            full_source_path = path
-
-        # If a destination prefix was specified, the destination artifact should
-        # be queried with the full destination path, i.e. the prefix joined with
-        # the globbed path.
-        if rule_data["dest_prefix"]:
-            full_dest_path = os.path.join(
-                rule_data["dest_prefix"], path
-            ).replace("\\", "/")
-
-        else:
-            full_dest_path = path
+        # Re-prepend the source prefix (which was subtracted above) and join
+        # the destination prefix, both via the shared normalizer.
+        full_source_path = _join_rule_prefix(
+            rule_data["source_prefix"], path
+        )
+        full_dest_path = _join_rule_prefix(
+            rule_data["dest_prefix"], path
+        )
 
         # Extract source artifact hash dict
         # We know the source artifact is available, it is also in the queue
         source_artifact = source_artifacts[full_source_path]
 
+        # An unresolved symbolic link has no real hash and must never be
+        # consumed as a successful MATCH, regardless of the destination.
+        if is_unresolved_hash_dict(source_artifact):
+            continue
+
         # Don't consume source artifact w/o corresponding dest artifact (by path)
         try:
             dest_artifact = dest_artifacts[full_dest_path]
         except KeyError:
+            continue
+
+        # Unresolved destination entries cannot match either.
+        if is_unresolved_hash_dict(dest_artifact):
             continue
 
         # Don't consume source artifact w/o corresponding dest artifact (by hash)
@@ -796,7 +810,7 @@ def verify_create_rule(rule_pattern, artifacts_queue, materials, products):
 
     """
     # Filter queued artifacts using the rule pattern
-    filtered_artifacts = fnmatch.filter(artifacts_queue, rule_pattern)
+    filtered_artifacts = path_glob_filter(artifacts_queue, rule_pattern)
 
     # Consume filtered artifacts that are products but not materials
     return set(filtered_artifacts) & (products - materials)
@@ -833,7 +847,7 @@ def verify_delete_rule(rule_pattern, artifacts_queue, materials, products):
 
     """
     # Filter queued artifacts using the rule pattern
-    filtered_artifacts = fnmatch.filter(artifacts_queue, rule_pattern)
+    filtered_artifacts = path_glob_filter(artifacts_queue, rule_pattern)
 
     # Consume filtered artifacts that are materials but not products
     return set(filtered_artifacts) & (materials - products)
@@ -870,7 +884,7 @@ def verify_modify_rule(rule_pattern, artifacts_queue, materials, products):
 
     """
     # Filter queued artifacts using the rule pattern
-    filtered_artifacts = fnmatch.filter(artifacts_queue, rule_pattern)
+    filtered_artifacts = path_glob_filter(artifacts_queue, rule_pattern)
 
     # Filter filtered artifacts that are materials and products
     filtered_artifacts = (
@@ -909,7 +923,7 @@ def verify_allow_rule(rule_pattern, artifacts_queue):
 
     """
     # Filter queued artifacts using the rule pattern
-    filtered_artifacts = fnmatch.filter(artifacts_queue, rule_pattern)
+    filtered_artifacts = path_glob_filter(artifacts_queue, rule_pattern)
 
     # Consume all filtered artifacts
     return set(filtered_artifacts)
@@ -943,7 +957,7 @@ def verify_disallow_rule(rule_pattern, artifacts_queue):
       None.
 
     """
-    filtered_artifacts = fnmatch.filter(artifacts_queue, rule_pattern)
+    filtered_artifacts = path_glob_filter(artifacts_queue, rule_pattern)
 
     if filtered_artifacts:
         raise RuleVerificationError(
@@ -1009,6 +1023,27 @@ def _get_artifact_rule_traceback():
         traceback_str += "{}\n".format(trace_entry["queue"])
 
     return traceback_str
+
+
+def _raise_if_unresolved_artifacts(artifacts):
+    """Fail rule verification for entries lacking a real hash.
+
+    Artifacts flagged as unresolved symbolic links have no real hash and
+    must never be silently consumed by an ALLOW/MATCH rule. They are
+    surfaced explicitly so rule verification cannot treat them as ordinary
+    files. Call this after RULE_TRACE has been populated.
+    """
+    unresolved = sorted(
+        name
+        for name, hash_dict in artifacts.items()
+        if is_unresolved_hash_dict(hash_dict)
+    )
+    if unresolved:
+        raise RuleVerificationError(
+            "The following artifacts were recorded with an unreadable "
+            "symbolic link target and cannot be verified: "
+            f"{unresolved}\n{_get_artifact_rule_traceback()}"
+        )
 
 
 def verify_item_rules(source_name, source_type, rules, links):
@@ -1095,6 +1130,11 @@ def verify_item_rules(source_name, source_type, rules, links):
     RULE_TRACE["materials"] = list(materials_dict)
     RULE_TRACE["products"] = list(products_dict)
     RULE_TRACE["trace"] = []
+
+    # Artifacts flagged as unresolved symbolic links have no real hash and
+    # must never be silently consumed. This runs after RULE_TRACE is
+    # populated so the error carries a full traceback.
+    _raise_if_unresolved_artifacts(artifacts)
 
     # Process rules and remove consumed items from queue in each iteration
     for rule in rules:

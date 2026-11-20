@@ -65,6 +65,11 @@ from in_toto.resolver import (
 # Inherits from in_toto base logger (c.f. in_toto.log)
 LOG = logging.getLogger(__name__)
 
+# Holds the normalized-key -> list of original spellings mapping produced by
+# the most recent record_artifacts_as_dict call. Populated as a side channel
+# for human inspection; the returned manifest dictionary itself is unchanged.
+_LAST_ARTIFACT_SPELLINGS = {}
+
 
 def record_artifacts_as_dict(  # noqa: PLR0913, PLR0917, RUF100
     artifacts,
@@ -193,15 +198,38 @@ def record_artifacts_as_dict(  # noqa: PLR0913, PLR0917, RUF100
     # FIXME: The behavior may change if we hash each artifact individually,
     # because the left-prefix duplicate check in FileResolver only works for the
     # artifacts hashed in one batch.
+    last_spellings = {}
     for resolver, uris in resolver_for_uris.items():
         artifact_hashes.update(resolver.hash_artifacts(uris))
+        # Retain original spellings for file-scheme artifacts, so the
+        # normalized manifest can be compared against the human-provided
+        # paths without changing the manifest's key format.
+        if isinstance(resolver, FileResolver):
+            last_spellings.update(resolver.last_spellings)
 
     # Clear resolvers to not preserve global state change beyond this function.
     # FIXME: This also clears resolver registered elsewhere. For now we
     # assume that we only modify RESOLVER_FOR_URI_SCHEME in this function.
     RESOLVER_FOR_URI_SCHEME.clear()
 
+    # Expose the normalized-key -> original-spellings mapping from the last
+    # batch through a module-level accessor (see get_last_artifact_spellings).
+    # Mutate the holder in place rather than rebinding the module global.
+    _LAST_ARTIFACT_SPELLINGS.clear()
+    _LAST_ARTIFACT_SPELLINGS.update(last_spellings)
+
     return artifact_hashes
+
+
+def get_last_artifact_spellings():
+    """Return the mapping of normalized manifest key to every original path
+    spelling seen during the most recent ``record_artifacts_as_dict`` call.
+
+    This is how original spellings are retained for manual comparison while
+    the on-disk manifest keeps normalized keys only. A normal single-spelling
+    batch maps each key to a one-element list containing that same key.
+    """
+    return dict(_LAST_ARTIFACT_SPELLINGS)
 
 
 def _subprocess_run_duplicate_streams(cmd, timeout):

@@ -26,6 +26,10 @@ from re import fullmatch
 from securesystemslib.exceptions import FormatError
 from securesystemslib.signer import Key, Signature
 
+from in_toto.exceptions import (
+    UNRESOLVED_SYMLINK_ALGO,
+    UNRESOLVED_SYMLINK_MARKER,
+)
 from in_toto.models._signer import GPGKey, GPGSignature
 
 
@@ -81,6 +85,12 @@ def _check_iso8601(arg):
 def _check_hash_dict(arg):
     """Check artifact hash dict."""
     _check_dict(arg)
+    # An unresolved symbolic link is recorded with a synthetic marker instead
+    # of a digest (see in_toto.path.unresolved_hash_dict). It must still be a
+    # string mapping so the manifest stays structurally valid.
+    if arg == {UNRESOLVED_SYMLINK_ALGO: UNRESOLVED_SYMLINK_MARKER}:
+        return
+
     for k, v in arg.items():
         _check_str(k)
         _check_hex(v)

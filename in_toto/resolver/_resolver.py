@@ -8,11 +8,21 @@ import os
 from abc import ABC, abstractmethod
 from functools import cmp_to_key
 from itertools import combinations
-from os.path import exists, isdir, isfile, join, normpath
+from os.path import isdir, isfile, join, normpath
 
 from pathspec import GitIgnoreSpec
 
-from in_toto.exceptions import PrefixError
+from in_toto.exceptions import (
+    PathConflictError,
+    PathEscapeError,
+    PrefixError,
+    SymlinkError,
+)
+from in_toto.path import (
+    PathNormalizer,
+    lstrip_segments,
+    unresolved_hash_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +56,11 @@ class FileResolver(Resolver):
     Provides a ``hash_artifacts`` method to generate hashes for passed file
     paths. The resolver is configurable via its constructor.
 
+    All path handling (normalization, base-directory containment checks,
+    conflict detection and prefix stripping) is delegated to a single
+    :class:`~in_toto.path.PathNormalizer` instance per batch, so that the
+    manifest written to disk and artifact rule matching share one and the
+    same normalized representation.
     """
 
     SCHEME = "file"
@@ -90,6 +105,38 @@ class FileResolver(Resolver):
         self._follow_symlink_dirs = follow_symlink_dirs
         self._normalize_line_endings = normalize_line_endings
         self._lstrip_paths = lstrip_paths
+        # Normalizer of the most recent batch, exposing the original
+        # spellings behind each normalized manifest key.
+        self._last_normalizer = None
+
+    @property
+    def last_spellings(self):
+        """Mapping of normalized manifest key to all original spellings seen
+        by the most recent ``hash_artifacts`` batch (empty before a run).
+
+        The manifest itself keeps normalized keys only (byte-compatible);
+        this property is the side channel that retains original spellings for
+        human comparison without changing the on-disk key format.
+        """
+        if self._last_normalizer is None:
+            return {}
+        return self._last_normalizer.spellings
+
+    def _make_normalizer(self):
+        """Create the normalizer for one batch.
+
+        The base directory is explicit: the configured ``base_path`` if
+        given, otherwise the current working directory resolved *now*. An
+        unstable value is never re-derived while traversing the batch.
+        """
+        base_path = self._base_path or os.getcwd()
+        normalizer = PathNormalizer(
+            base_path,
+            lstrip_paths=self._lstrip_paths,
+            follow_symlink_dirs=self._follow_symlink_dirs,
+        )
+        self._last_normalizer = normalizer
+        return normalizer
 
     def _exclude(self, path):
         """Helper to check, if path matches pre-compiled exclude patterns."""
@@ -104,27 +151,11 @@ class FileResolver(Resolver):
         )
         return {_HASH_ALGORITHM: hexdigest}
 
-    def _mangle(self, path, existing_paths, scheme_prefix):
-        """Helper for path mangling."""
-
-        # Normalize slashes for cross-platform metadata consistency
-        path = path.replace("\\", "/")
-
-        # Left-strip names using configured path prefixes
-        for lstrip_path in self._lstrip_paths:
-            if path.startswith(lstrip_path):
-                path = path[len(lstrip_path) :]
-                break
-
-        # Fail if left-stripping above results in duplicates
-        if self._lstrip_paths and path in existing_paths:
-            raise PrefixError(
-                "Prefix selection has resulted in non unique dictionary key "
-                f"'{path}'"
-            )
-
-        # Prepend passed scheme prefix
-        return scheme_prefix + path
+    def _mangle(self, key, scheme_prefix):
+        """Helper to re-add the scheme prefix to a normalized manifest key."""
+        # Normal path keys are unchanged apart from the optional scheme
+        # prefix; all other mangling happened exactly once in the normalizer.
+        return scheme_prefix + key
 
     def _strip_scheme_prefix(self, path):
         """Helper to strip file resolver scheme prefix from path."""
@@ -137,69 +168,136 @@ class FileResolver(Resolver):
 
         return path, prefix
 
+    def _record_file(self, normalizer, disk_path, original, hashes, scheme_prefix):
+        """Normalize, validate and hash one file.
+
+        Per-entry hard failures (escape, conflict, dangling link) are
+        recorded on the normalizer and propagated; the batch continues with
+        the remaining entries and reports every failure at the end. A link
+        whose target exists but cannot be hashed degrades to an explicitly
+        marked entry (soft failure).
+        """
+        try:
+            normalized = normalizer.normalize(disk_path, original)
+        except (PathEscapeError, SymlinkError):
+            return
+
+        # Files reached through a followed symlink directory must still
+        # resolve inside the base directory. Symbolic links keep their link
+        # name as key; the target is used for reading only.
+        try:
+            normalizer.check_within_base(normalized)
+        except PathEscapeError:
+            return
+
+        try:
+            normalized = normalizer.register(normalized)
+        except (PathConflictError, PrefixError):
+            return
+
+        if not isfile(normalized.abs_path):
+            # Broken symlink or vanished file: degrade instead of silently
+            # skipping, so rule matching can see the marker.
+            entry = normalizer.mark_unresolved(normalized)
+            hashes[self._mangle(entry.key, scheme_prefix)] = unresolved_hash_dict()
+            return
+
+        try:
+            hash_dict = self._hash(normalized.abs_path)
+        except OSError as err:
+            logger.info("hashing '%s' failed: %s", normalized.key, err)
+            entry = normalizer.mark_unresolved(normalized)
+            hashes[self._mangle(entry.key, scheme_prefix)] = unresolved_hash_dict()
+            return
+
+        hashes[self._mangle(normalized.key, scheme_prefix)] = hash_dict
+
     def hash_artifacts(self, uris):  # noqa: C901
         hashes = {}
+        normalizer = self._make_normalizer()
+        base = normalizer.base_path
 
+        cwd = os.getcwd()
         if self._base_path:
-            original_cwd = os.getcwd()
             os.chdir(self._base_path)
 
-        for path in uris:
-            # Remove scheme prefix, but preserver to re-add later (see _mangle)
-            path, prefix = self._strip_scheme_prefix(path)  # noqa: PLW2901
+        try:
+            for uri in uris:
+                # Remove scheme prefix, but preserve it to re-add later
+                # (see _mangle)
+                path, prefix = self._strip_scheme_prefix(uri)
+                original = path
 
-            # Normalize URI before filtering and returning them
-            # FIXME: Is this expected behavior? Does this make exclude patterns
-            # with slashes platform-dependent? Check how 'gitwildmatch' treats
-            # dots and slashes!
-            path = normpath(path)  # noqa: PLW2901
+                # Exclude filtering keeps its existing gitignore-style
+                # semantics and is applied to the normpath spelling of the
+                # URI, exactly as in the previous implementation.
+                if self._exclude(normpath(path)):
+                    continue
 
-            if self._exclude(path):
-                continue
+                # Anchor every URI at the explicit base up-front, so mixing
+                # absolute and relative paths compares against one benchmark.
+                abs_disk = (
+                    os.path.abspath(path)
+                    if os.path.isabs(path)
+                    else os.path.abspath(join(base, path))
+                )
 
-            if not exists(path):
-                logger.info("path: %s does not exist, skipping..", path)
-                continue
+                # Use lexists so a symbolic link is seen even when its target
+                # is missing. Such links must reach the normalizer to produce
+                # a locatable error instead of being silently skipped.
+                if not os.path.lexists(abs_disk):
+                    logger.info("path: %s does not exist, skipping..", path)
+                    continue
 
-            if isfile(path):
-                name = self._mangle(path, hashes, prefix)
-                hashes[name] = self._hash(path)
+                # A symbolic link (including a dangling one) is always routed
+                # through the normalizer, which validates the target and
+                # reports locatable errors.
+                if os.path.islink(abs_disk) or isfile(abs_disk):
+                    self._record_file(
+                        normalizer, abs_disk, original, hashes, prefix
+                    )
+                    continue
 
-            if isdir(path):
-                for base, dirs, names in os.walk(
-                    path, followlinks=self._follow_symlink_dirs
-                ):
-                    # Filter directories to avoid unnecessary recursion below
-                    # NOTE: Normalize to filter on directory paths without
-                    # their dot-slash prefix, if path was dot.
-                    dirs[:] = [
-                        dirname
-                        for dirname in dirs
-                        if not self._exclude(normpath(join(base, dirname)))
-                    ]
-
-                    for filename in names:
-                        # NOTE: Normalize to filter on and return file paths
-                        # without their dot-slash prefix, if path was dot.
-                        filepath = normpath(join(base, filename))
-
-                        if self._exclude(filepath):
-                            continue
-
-                        if not isfile(filepath):
-                            logger.info(
-                                "File '%s' appears to be a broken symlink. "
-                                "Skipping...",
-                                filepath,
+                if isdir(abs_disk):
+                    for walk_base, dirs, names in os.walk(
+                        abs_disk, followlinks=self._follow_symlink_dirs
+                    ):
+                        # Filter directories to avoid unnecessary recursion.
+                        # Exclude patterns see paths relative to the base
+                        # directory, matching the previous behavior.
+                        dirs[:] = [
+                            dirname
+                            for dirname in dirs
+                            if not self._exclude(
+                                normpath(
+                                    os.path.relpath(
+                                        join(walk_base, dirname), base
+                                    )
+                                )
                             )
-                            continue
+                        ]
 
-                        name = self._mangle(filepath, hashes, prefix)
-                        hashes[name] = self._hash(filepath)
+                        for filename in names:
+                            filepath = join(walk_base, filename)
+                            rel_filepath = os.path.relpath(filepath, base)
 
-        # Change back to original current working dir
-        if self._base_path:
-            os.chdir(original_cwd)
+                            if self._exclude(normpath(rel_filepath)):
+                                continue
+
+                            self._record_file(
+                                normalizer,
+                                filepath,
+                                rel_filepath,
+                                hashes,
+                                prefix,
+                            )
+        finally:
+            if self._base_path:
+                os.chdir(cwd)
+
+        # Any escape, conflict or dangling link fails the whole batch; the
+        # message lists every offending (base-relative) source spelling.
+        normalizer.raise_if_failed()
 
         return hashes
 
@@ -305,14 +403,10 @@ class DirectoryResolver(Resolver):
     def _mangle(self, path, existing_paths):
         """Helper for path mangling."""
 
-        # Normalize slashes for cross-platform metadata consistency
-        path = path.replace("\\", "/")
-
-        # Left-strip names using configured path prefixes
-        for lstrip_path in self._lstrip_paths:
-            if path.startswith(lstrip_path):
-                path = path[len(lstrip_path) :]
-                break
+        # Normalize slashes for cross-platform metadata consistency, then
+        # apply the same segment-boundary prefix stripping as the file
+        # resolver (the normalization code is shared, not duplicated).
+        path = lstrip_segments(path, self._lstrip_paths)
 
         # Prepend passed scheme prefix
         # We do this first because the entries in existing_paths have the scheme

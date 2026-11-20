@@ -386,9 +386,14 @@ class TestRecordArtifactsAsDict(unittest.TestCase, TmpDirMixin):  # noqa: PLR090
         "symlink is not supported in this platform",
     )
     def test_record_without_dead_symlinks(self):
-        """Dead symlinks are never recorded."""
+        """Dead symlinks produce a locatable error instead of being skipped.
 
-        # Dead symlinks are never recorded ...
+        The previous behavior of silently skipping dead links let broken or
+        malicious links disappear from the manifest. Path normalization now
+        reports the link name (relative to the base) and fails the batch.
+        """
+
+        # Dead symlinks are reported ...
         links = [
             "foo_link",
             "subdir/foosub2_link",
@@ -403,18 +408,17 @@ class TestRecordArtifactsAsDict(unittest.TestCase, TmpDirMixin):  # noqa: PLR090
                 TestRecordArtifactsAsDict._raise_win_dev_mode_error()
                 raise
 
-        # Record files without dead links
-        # follow_symlink_dirs does not make a difference as it only concerns linked dirs
+        # Recording fails with a locatable SymlinkError naming every link,
+        # and no absolute path details leak into the message.
         for follow_symlink_dirs in [True, False]:
-            artifacts_dict = record_artifacts_as_dict(
-                ["."], follow_symlink_dirs=follow_symlink_dirs
-            )
-
-            # Test only the files were recorded ...
-            self.assertListEqual(
-                sorted(artifacts_dict.keys()),
-                sorted(self.full_file_path_list),
-            )
+            with self.assertRaises(in_toto.exceptions.SymlinkError) as ctx:
+                record_artifacts_as_dict(
+                    ["."], follow_symlink_dirs=follow_symlink_dirs
+                )
+            message = str(ctx.exception)
+            for link in links:
+                self.assertIn(link, message)
+            self.assertNotIn(os.path.abspath(link), message)
 
         for link in links:
             os.unlink(link)
@@ -890,6 +894,11 @@ class TestInTotoRun(unittest.TestCase, TmpDirMixin):
                 os.write(fd, b"hello" + line_ending + b"toto")
                 os.close(fd)
 
+            # Absolute artifact paths must be anchored to an explicit base
+            # directory; here the temp directory is that base, so the files
+            # remain within the allowed range (see PathNormalizer).
+            base_path = tempfile.gettempdir()
+
             # Call in_toto_run and record artifacts as materials and products
             # with line ending normalization on
             link = in_toto_run(
@@ -897,6 +906,7 @@ class TestInTotoRun(unittest.TestCase, TmpDirMixin):
                 paths,
                 paths,
                 [VersionedPython, "--version"],
+                base_path=base_path,
                 normalize_line_endings=True,
             ).signed
 
@@ -1199,18 +1209,24 @@ class TestInTotoRecordStop(unittest.TestCase, TmpDirMixin):
                 os.write(fd, b"hello" + line_ending + b"toto")
                 os.close(fd)
 
+            # Absolute artifact paths must be anchored to an explicit base
+            # directory, which here is the temp directory (see PathNormalizer).
+            base_path = tempfile.gettempdir()
+
             # Call in_toto_record start and stop and record artifacts as
             # materials and products with line ending normalization on
             in_toto_record_start(
                 self.step_name,
                 paths,
                 signer=self.signer,
+                base_path=base_path,
                 normalize_line_endings=True,
             )
             in_toto_record_stop(
                 self.step_name,
                 paths,
                 signer=self.signer,
+                base_path=base_path,
                 normalize_line_endings=True,
             )
             link = Metablock.load(self.link_name).signed
