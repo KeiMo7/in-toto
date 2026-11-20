@@ -45,17 +45,117 @@ import in_toto.settings
 from in_toto.exceptions import (
     BadReturnValueError,
     LayoutExpiredError,
+    LayoutReferenceError,
     RuleVerificationError,
     SignatureVerificationError,
     ThresholdVerificationError,
 )
 from in_toto.formats import _check_parameter_dict, _check_public_keys
 from in_toto.models.metadata import Metadata
+from in_toto.verify_report import (
+    CATEGORY_COMMAND_MISMATCH,
+    CATEGORY_INCONSISTENT_ARTIFACTS,
+    CATEGORY_INSPECTION_FAILURE,
+    CATEGORY_INSPECTION_SKIPPED,
+    CATEGORY_INSUFFICIENT_SIGNERS,
+    CATEGORY_LAYOUT_EXPIRED,
+    CATEGORY_LAYOUT_SIGNATURE,
+    CATEGORY_METADATA_MISSING,
+    CATEGORY_METADATA_UNPARSEABLE,
+    CATEGORY_RULE_EVALUATION_ERROR,
+    CATEGORY_RULE_VIOLATION,
+    CATEGORY_SUBLAYOUT_FAILURE,
+    SEVERITY_UNDETERMINED,
+    SEVERITY_WARNING,
+    ItemResult,
+    VerificationReport,
+    exception_chain,
+    make_issue,
+)
+
+# A step whose *evidence* is not trustworthy cannot provide artifact evidence
+# to other steps. These categories mean the link metadata itself could not be
+# authenticated or read, as opposed to authentic metadata that violates a rule.
+TRUST_FAILURE_CATEGORIES = {
+    CATEGORY_INSUFFICIENT_SIGNERS,
+    CATEGORY_LAYOUT_EXPIRED,
+    CATEGORY_LAYOUT_SIGNATURE,
+    CATEGORY_METADATA_MISSING,
+    CATEGORY_METADATA_UNPARSEABLE,
+    CATEGORY_SUBLAYOUT_FAILURE,
+}
 
 # Inherits from in_toto base logger (c.f. in_toto.log)
 LOG = logging.getLogger(__name__)
 
 RULE_TRACE = {}
+
+
+def _has_trust_failure(item):
+    """Return True if an item's evidence could not be authenticated or read."""
+    return any(
+        issue.category in TRUST_FAILURE_CATEGORIES
+        for issue in item.iter_issues()
+    )
+
+
+def _iter_step_dependency_names(step, layout):
+    """Yield the names of the steps that ``step``'s MATCH rules reference."""
+    step_names = {other.name for other in layout.steps}
+    for _rule, dest_name in _iter_rule_references(step):
+        if dest_name in step_names and dest_name != step.name:
+            yield dest_name
+
+
+def _item_report_scope(item):
+    """Return a report container whose only known item is ``item``.
+
+    ``verify_all_item_rules`` looks up item results by name. Wrapping a single
+    item ensures findings are attributed to exactly that item (and, for
+    inspections, not confused with a step of the same name).
+    """
+
+    class _ItemScope:
+        def __init__(self, known):
+            self._known = known
+            self.items = [known]
+
+        def get_or_add_child(self, name, kind="step"):  # noqa: ARG002
+            return self._known
+
+        def add_issue(self, issue):
+            self._known.add_issue(issue)
+
+    return _ItemScope(item)
+
+
+def _find_item(container, name):
+    """Find an ItemResult by name in a report or in an item's nested reports."""
+    if isinstance(container, VerificationReport):
+        candidates = container.items
+    elif isinstance(container, ItemResult):
+        candidates = container.sub_reports
+    else:  # pragma: no cover (programming error)
+        candidates = []
+
+    for item in candidates:
+        if item.name == name:
+            return item
+    return None
+
+
+def _add_item_issue(container, name, issue):
+    """Attribute an issue to the item named ``name``.
+
+    If the item is not known, the issue is added to the container itself (for
+    an ItemResult) or to the report's layout-level issues, so that no finding
+    is silently dropped.
+    """
+    item = _find_item(container, name)
+    if item is not None:
+        item.add_issue(issue)
+    else:
+        container.add_issue(issue)
 
 
 def _raise_on_bad_retval(return_value, command=None):
@@ -97,7 +197,160 @@ def _raise_on_bad_retval(return_value, command=None):
         raise BadReturnValueError(msg.format(what="zero"))
 
 
-def load_links_for_layout(layout, link_dir_path):
+def _iter_rule_references(item):
+    """Yield ``(rule, dest_name)`` for every MATCH rule of a step/inspection."""
+    for rules in (item.expected_materials, item.expected_products):
+        for rule in rules:
+            rule_data = in_toto.rulelib.unpack_rule(rule)
+            if rule_data["rule_type"] == "match":
+                yield rule, rule_data["dest_name"]
+
+
+def get_step_dependencies(layout):
+    """Return, per step, the set of step names its rules reference.
+
+    Only MATCH rules create material flow between steps. Inspections are not
+    dependency graph nodes, because they are executed after all steps and can
+    reference any of them.
+    """
+    step_names = {step.name for step in layout.steps}
+    dependencies = {step.name: set() for step in layout.steps}
+
+    for step in layout.steps:
+        for _rule, dest_name in _iter_rule_references(step):
+            if dest_name in step_names and dest_name != step.name:
+                dependencies[step.name].add(dest_name)
+
+    return dependencies
+
+
+def _validate_step_references(layout):
+    """Reject malformed artifact-rule references before verification starts.
+
+    Raises:
+      LayoutReferenceError: A rule references an item that does not exist in
+          the layout (a rule can reference a step, or an inspection), or step
+          references form a cycle. The exception names the offending item,
+          rule and, for cycles, the cycle's step path.
+
+    Returns:
+      The step dependency graph as returned by ``get_step_dependencies``.
+
+    """
+    step_names = {step.name for step in layout.steps}
+    item_names = step_names | {inspection.name for inspection in layout.inspect}
+    dependencies = get_step_dependencies(layout)
+
+    for step in layout.steps:
+        for rule, dest_name in _iter_rule_references(step):
+            if dest_name != step.name and dest_name not in item_names:
+                raise LayoutReferenceError(
+                    f"Step '{step.name}' references unknown step"
+                    f" '{dest_name}' in rule '{' '.join(rule)}'.",
+                    step=step.name,
+                    reference=dest_name,
+                )
+
+    for inspection in layout.inspect:
+        for rule, dest_name in _iter_rule_references(inspection):
+            if dest_name not in item_names:
+                raise LayoutReferenceError(
+                    f"Inspection '{inspection.name}' references unknown"
+                    f" step '{dest_name}' in rule '{' '.join(rule)}'.",
+                    step=inspection.name,
+                    reference=dest_name,
+                )
+
+    ordered = _topological_order(dependencies)
+    if ordered is None:
+        cycle = _find_cycle(dependencies)
+        cycle_str = " -> ".join(cycle)
+        raise LayoutReferenceError(
+            "Step references form a cycle: "
+            f"{cycle_str}. Step order must be derived from artifact"
+            " dependencies, which requires an acyclic graph.",
+            step=cycle[0],
+            reference=cycle[-1],
+            cycle=cycle,
+        )
+
+    return dependencies
+
+
+def _find_cycle(dependencies):
+    """Return one cycle in a step dependency graph as a list of step names.
+
+    The returned list starts and ends with the same step name. Only called
+    when the graph is known to contain a cycle.
+    """
+    # Deterministic DFS: visit steps and their dependencies in sorted order.
+    visited = set()
+    stack = []
+    on_stack = set()
+
+    def visit(node):
+        visited.add(node)
+        stack.append(node)
+        on_stack.add(node)
+        for dependency in sorted(dependencies.get(node, ())):
+            if dependency not in visited:
+                cycle = visit(dependency)
+                if cycle:
+                    return cycle
+            elif dependency in on_stack:
+                start = stack.index(dependency)
+                return [*stack[start:], dependency]
+        stack.pop()
+        on_stack.discard(node)
+        return None
+
+    for node in sorted(dependencies):
+        if node not in visited:
+            cycle = visit(node)
+            if cycle:
+                return cycle
+    return []  # pragma: no cover (caller only invokes on cyclical graphs)
+
+
+def _topological_order(dependencies):
+    """Return step names in deterministic dependency order, or None on cycles.
+
+    The order is derived solely from artifact dependencies. Steps that are
+    independent of each other (including steps with no connections) are
+    ordered by name, so neither layout order, directory traversal order nor
+    hash order can influence the result. Dependencies are listed before their
+    dependents.
+    """
+    remaining = {name: set(deps) for name, deps in dependencies.items()}
+    ordered = []
+
+    while remaining:
+        ready = sorted(name for name, deps in remaining.items() if not deps)
+        if not ready:
+            return None
+        # Emit all currently unblocked steps, then remove them from the graph.
+        ordered.extend(ready)
+        for name in ready:
+            del remaining[name]
+        for deps in remaining.values():
+            deps.difference_update(ready)
+
+    return ordered
+
+
+def verify_step_order(layout):
+    """Return step names in dependency order, validating references first.
+
+    Raises:
+      LayoutReferenceError: See ``_validate_step_references``.
+
+    """
+    return _topological_order(_validate_step_references(layout))
+
+
+def load_links_for_layout(
+    layout, link_dir_path, report=None, step_paths=None, raise_on_missing=True
+):
     """
     <Purpose>
       Try to load all existing metadata files for each Step of the Layout
@@ -113,6 +366,21 @@ def load_links_for_layout(layout, link_dir_path):
       link_dir_path:
             A path to directory where links are loaded from
 
+      report: (optional)
+            A VerificationReport (or ItemResult for a sublayout) to which
+            missing and unparseable metadata findings are attributed. If
+            passed, unparseable metadata is skipped and recorded as a failure
+            of the step instead of aborting the whole batch.
+
+      step_paths: (optional)
+            A mapping of step name to full report path, used to attribute
+            findings to nested steps.
+
+      raise_on_missing: (optional)
+            If True (default), raise LinkNotFoundError on a preliminary
+            threshold violation, preserving the historical behaviour.
+            Report-driven verification passes False and records the finding
+            instead, so that all steps still get an independent result.
 
     <Side Effects>
       Calls function to read files from disk
@@ -120,7 +388,8 @@ def load_links_for_layout(layout, link_dir_path):
     <Exceptions>
       in_toto.exceptions.LinkNotFoundError,
               if fewer than `threshold` link files can be found for any given
-              step of the supply chain (preliminary threshold check)
+              step of the supply chain (preliminary threshold check), and
+              `raise_on_missing` is True.
 
     <Returns>
       A dictionary carrying all the found metadata corresponding to the
@@ -136,6 +405,7 @@ def load_links_for_layout(layout, link_dir_path):
 
     """
     steps_metadata = {}
+    step_paths = step_paths or {}
 
     # Iterate over all the steps in the layout
     for step in layout.steps:
@@ -161,14 +431,68 @@ def load_links_for_layout(layout, link_dir_path):
                 except OSError:
                     pass
 
+                except Exception as exc:
+                    # Without a report, preserve the historical behaviour and
+                    # propagate malformed metadata. With a report, unparseable
+                    # metadata is not fatal for the whole batch, but it is a
+                    # failure of this step and must be reported as such.
+                    if report is None:
+                        raise
+                    LOG.warning(
+                        "Skipping unparseable link metadata for step '%s'"
+                        " (keyid '%s'): %s",
+                        step.name,
+                        keyid,
+                        exc,
+                    )
+                    _add_item_issue(
+                        report,
+                        step.name,
+                        make_issue(
+                            CATEGORY_METADATA_UNPARSEABLE,
+                            f"Could not parse link metadata '{filename}':"
+                            f" {exc}",
+                            path=step_paths.get(step.name, (step.name,)),
+                            details={
+                                "filename": filename,
+                                "keyid": keyid,
+                                "error": exception_chain(exc),
+                            },
+                        ),
+                    )
+
         # This is only a preliminary threshold check, based on (authorized)
         # filenames, to fail early. A more thorough signature-based threshold
         # check is indispensable.
         if len(links_per_step) < step.threshold:
-            raise in_toto.exceptions.LinkNotFoundError(
+            message = (
                 f"Step '{step.name}' requires '{step.threshold}'"
                 f" link metadata file(s), found '{len(links_per_step)}'."
             )
+            if raise_on_missing:
+                raise in_toto.exceptions.LinkNotFoundError(message)
+
+            # Distinguish "no information at all" from "not enough signers":
+            # only the former is undetermined here. If some metadata exists,
+            # signature threshold verification reports the concrete signer
+            # deficit (satisfied/missing counts) as a failure.
+            if report is not None and len(links_per_step) == 0:
+                _add_item_issue(
+                    report,
+                    step.name,
+                    make_issue(
+                        CATEGORY_METADATA_MISSING,
+                        message
+                        + " No link metadata was found, so this step cannot"
+                        " be evaluated.",
+                        path=step_paths.get(step.name, (step.name,)),
+                        severity=SEVERITY_UNDETERMINED,
+                        details={
+                            "found": len(links_per_step),
+                            "required": step.threshold,
+                        },
+                    ),
+                )
 
         steps_metadata[step.name] = links_per_step
 
@@ -399,7 +723,9 @@ def verify_metadata_signatures(metadata, keys_dict):
         metadata.verify_signature(verify_key)
 
 
-def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR0912
+def verify_link_signature_thresholds(  # noqa: C901, PLR0912, PLR0915
+    layout, steps_metadata, report=None, step_paths=None
+):
     """
     <Purpose>
       Verify that for each step of the layout there are at least `threshold`
@@ -411,6 +737,10 @@ def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR
       with a subkey `K'`, then `K'` is authorized implicitly, to sign any link
       that `K` is authorized to sign. In other words, the trust in a master key
       extends to the trust in a subkey. The inverse is not true.
+
+      NOTE: A threshold always counts distinct signers, not distinct keys or
+      files. Links signed by a master key and by one or more of its subkeys
+      count as one signer.
 
     <Arguments>
       layout:
@@ -427,11 +757,22 @@ def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR
                 }, ...
               }
 
+      report: (optional)
+              A VerificationReport (or ItemResult for a sublayout). If passed,
+              threshold violations are recorded per step, together with the
+              number of satisfied signers and the number of missing signers,
+              and verification continues with the remaining steps instead of
+              raising on the first violation.
+
+      step_paths: (optional)
+              A mapping of step name to full report path, used to attribute
+              findings to nested steps.
+
     <Exceptions>
       ThresholdVerificationError
               If any of the steps of the passed layout does not have enough
               (`step.threshold`) links signed by different authorized
-              functionaries.
+              functionaries. Only raised if no `report` is passed.
 
     <Returns>
       A steps_metadata containing only links with valid signatures created by
@@ -439,6 +780,8 @@ def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR
 
     """
     # pylint: disable=too-many-locals
+
+    step_paths = step_paths or {}
 
     # Create an inverse keys-subkeys dictionary, with subkey keyids as
     # dictionary keys and main keys as dictionary values. This will be
@@ -463,11 +806,28 @@ def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR
     for step in layout.steps:
         # Dict for valid and authorized links of a given step
         verified_key_link_dict = {}
-        # List of used keyids
+        # List of used signers, identified by their main keyid. Iterate over
+        # sorted link keyids so the reported signer list does not depend on
+        # dictionary insertion or hash order.
         used_main_keyids = []
 
+        step_metadata = steps_metadata.get(step.name, {})
+
         # Do per step link threshold verification
-        for link_keyid, link in steps_metadata.get(step.name, {}).items():
+        for link_keyid in sorted(step_metadata):
+            link = step_metadata[link_keyid]
+            try:
+                link.get_payload()
+            except Exception:  # noqa: BLE001
+                # Malformed payloads were already recorded when loading.
+                LOG.info(
+                    "Skipping link with unparseable payload for step '%s'"
+                    " (keyid '%s').",
+                    step.name,
+                    link_keyid,
+                )
+                continue
+
             # Iterate over authorized keyids to find a key or subkey corresponding
             # to the given link and check if the link's keyid is authorized.
             # Subkeys of authorized main keys are authorized implicitly.
@@ -539,16 +899,57 @@ def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR
         # distinct authorized functionaries. Links signed by different subkeys of
         # the same main key are counted only once towards the threshold.
         valid_authorized_links_cnt = len(set(used_main_keyids))
+        distinct_signers = sorted(set(used_main_keyids))
         # TODO: To guarantee that links are signed by different functionaries
         # we rely on the layout to not carry duplicate verification keys under
         # different dictionary keys, e.g. {keyid1: KEY1, keyid2: KEY1}
         # Maybe we should add such a check to the layout validation? Or here?
+
+        if report is not None:
+            _record_signer_counts(
+                report,
+                step,
+                step_metadata,
+                valid_authorized_links_cnt,
+                distinct_signers,
+            )
+
         if valid_authorized_links_cnt < step.threshold:
-            raise ThresholdVerificationError(
+            message = (
                 f"Step '{step.name}' requires at least '{step.threshold}' links"
                 " validly signed by different authorized functionaries. Only"
                 f" found '{valid_authorized_links_cnt}'"
             )
+            if report is None:
+                raise ThresholdVerificationError(message)
+
+            # Zero metadata for the step is reported as "undetermined" during
+            # loading (there is nothing to count). Here, at least one piece of
+            # metadata exists, so the signer deficit is a definite failure.
+            if len(step_metadata) > 0:
+                _add_item_issue(
+                    report,
+                    step.name,
+                    make_issue(
+                        CATEGORY_INSUFFICIENT_SIGNERS,
+                        message
+                        + f", missing '{step.threshold - valid_authorized_links_cnt}'"
+                        " distinct signer(s)."
+                        f" Satisfied signers: '{valid_authorized_links_cnt}',"
+                        f" missing signers:"
+                        f" '{step.threshold - valid_authorized_links_cnt}',"
+                        f" required signers: '{step.threshold}'.",
+                        path=step_paths.get(step.name, (step.name,)),
+                        details={
+                            "satisfied_signers": valid_authorized_links_cnt,
+                            "missing_signers": step.threshold
+                            - valid_authorized_links_cnt,
+                            "required_signers": step.threshold,
+                            "found_metadata": len(step_metadata),
+                            "signer_keyids": distinct_signers,
+                        },
+                    ),
+                )
 
         # Add all good links of this step to the dictionary of links of all steps
         verified_steps_metadata[step.name] = verified_key_link_dict
@@ -556,6 +957,20 @@ def verify_link_signature_thresholds(layout, steps_metadata):  # noqa: C901, PLR
     # Threshold verification succeeded, return valid and authorized links for
     # further verification
     return verified_steps_metadata
+
+
+def _record_signer_counts(
+    report, step, step_metadata, satisfied, signer_keyids
+):
+    """Attach threshold and signer counts to a step's report item."""
+    item = _find_item(report, step.name)
+    if item is None:
+        return
+    item.threshold = step.threshold
+    item.satisfied_signers = satisfied
+    item.missing_signers = max(step.threshold - satisfied, 0)
+    item.signer_keyids = tuple(signer_keyids)
+    item.found_metadata = len(step_metadata)
 
 
 def verify_command_alignment(command, expected_command):
@@ -1011,7 +1426,9 @@ def _get_artifact_rule_traceback():
     return traceback_str
 
 
-def verify_item_rules(source_name, source_type, rules, links):
+def verify_item_rules(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
+    source_name, source_type, rules, links, issue_sink=None, path=None
+):
     """
     <Purpose>
       Apply all passed material or product rules (see source_type) of a given
@@ -1053,6 +1470,16 @@ def verify_item_rules(source_name, source_type, rules, links):
                 ...
               }
 
+      issue_sink: (optional)
+              A callable receiving a ``VerificationIssue`` for every failed
+              rule. If passed, rule violations and evaluation errors are
+              recorded and verification continues with the remaining rules,
+              so that all violations of an item are reported at once. Only the
+              first violation is used to build the raised exception, if any.
+
+      path: (optional)
+              Full report path of the item being verified.
+
     <Exceptions>
       FormatError
           if source_type is not "materials" or "products", or
@@ -1061,7 +1488,9 @@ def verify_item_rules(source_name, source_type, rules, links):
 
       RuleVerificationError
           if a DISALLOW rule matches disallowed artifacts, or
-          if a REQUIRE rule does not find a required artifact.
+          if a REQUIRE rule does not find a required artifact. Not raised if
+          an `issue_sink` is passed; the caller is responsible for turning the
+          recorded issues into an exception.
 
     <Side Effects>
       Clears and populates the global RULE_TRACE data structure.
@@ -1072,6 +1501,8 @@ def verify_item_rules(source_name, source_type, rules, links):
             "Argument 'source_type' of function 'verify_item_rules' has to be "
             f"one of 'materials' or 'products'. Got: '{source_type}'"
         )
+
+    path = tuple(path) if path else (source_name,)
 
     # Create shortcuts to item's materials and products (including hashes),
     # required to verify "modify" and "match" rules.
@@ -1088,13 +1519,19 @@ def verify_item_rules(source_name, source_type, rules, links):
     artifacts = getattr(links[source_name], source_type)
     artifacts_queue = set(artifacts.keys())
 
-    # Reset and re-populate rule traceback info dict for a rich error message
+    # Reset and re-populate rule traceback info dict for a rich error message.
+    # In report mode the traceback ends up in the report, which must be
+    # deterministic, so its collections are sorted. The legacy exception path
+    # keeps the historical insertion order.
+    as_list = sorted if issue_sink is not None else list
     RULE_TRACE.clear()
     RULE_TRACE["source_name"] = source_name
     RULE_TRACE["source_type"] = source_type
-    RULE_TRACE["materials"] = list(materials_dict)
-    RULE_TRACE["products"] = list(products_dict)
+    RULE_TRACE["materials"] = as_list(materials_dict)
+    RULE_TRACE["products"] = as_list(products_dict)
     RULE_TRACE["trace"] = []
+
+    first_exception = None
 
     # Process rules and remove consumed items from queue in each iteration
     for rule in rules:
@@ -1109,51 +1546,105 @@ def verify_item_rules(source_name, source_type, rules, links):
         # artifacts. All rules except "disallow" and "require" consume artifacts.
         consumed = set()
 
-        if _type == "match":
-            consumed = verify_match_rule(
-                rule_data, artifacts_queue, artifacts, links
+        try:
+            if _type == "match":
+                consumed = verify_match_rule(
+                    rule_data, artifacts_queue, artifacts, links
+                )
+
+            elif _type == "create":
+                consumed = verify_create_rule(
+                    pattern, artifacts_queue, materials_paths, products_paths
+                )
+
+            elif _type == "delete":
+                consumed = verify_delete_rule(
+                    pattern, artifacts_queue, materials_paths, products_paths
+                )
+
+            elif _type == "modify":
+                consumed = verify_modify_rule(
+                    pattern, artifacts_queue, materials_dict, products_dict
+                )
+
+            elif _type == "allow":
+                consumed = verify_allow_rule(pattern, artifacts_queue)
+
+            # It's up to the "disallow" and "require" rule to raise an error if
+            # artifacts were not consumed as intended
+            elif _type == "disallow":
+                verify_disallow_rule(pattern, artifacts_queue)
+
+            elif _type == "require":
+                verify_require_rule(pattern, artifacts_queue)
+
+            else:  # pragma: no cover (unreachable)
+                raise securesystemslib.exceptions.FormatError(
+                    f"Invaldid rule type '{_type}'."
+                )
+
+        except (
+            RuleVerificationError,
+            securesystemslib.exceptions.FormatError,
+        ) as exc:
+            if issue_sink is None:
+                raise
+
+            # Report the violation and continue, so that every rule of every
+            # item gets an independent outcome. A failed rule consumed
+            # nothing, so the queue stays unchanged for the remaining rules.
+            if first_exception is None:
+                first_exception = exc
+            issue_sink(
+                _rule_issue(
+                    exc, rule, rule_data, source_type, artifacts_queue, path
+                )
             )
 
-        elif _type == "create":
-            consumed = verify_create_rule(
-                pattern, artifacts_queue, materials_paths, products_paths
-            )
-
-        elif _type == "delete":
-            consumed = verify_delete_rule(
-                pattern, artifacts_queue, materials_paths, products_paths
-            )
-
-        elif _type == "modify":
-            consumed = verify_modify_rule(
-                pattern, artifacts_queue, materials_dict, products_dict
-            )
-
-        elif _type == "allow":
-            consumed = verify_allow_rule(pattern, artifacts_queue)
-
-        # It's up to the "disallow" and "require" rule to raise an error if
-        # artifacts were not consumed as intended
-        elif _type == "disallow":
-            verify_disallow_rule(pattern, artifacts_queue)
-
-        elif _type == "require":
-            verify_require_rule(pattern, artifacts_queue)
-
-        else:  # pragma: no cover (unreachable)
-            raise securesystemslib.exceptions.FormatError(
-                f"Invaldid rule type '{_type}'."
-            )
-
-        artifacts_queue -= consumed
+        else:
+            artifacts_queue -= consumed
 
         # Append rule and copy of queue to global info for a rich error message
         RULE_TRACE["trace"].append(
-            {"rule": rule, "queue": list(artifacts_queue)}
+            {"rule": rule, "queue": as_list(artifacts_queue)}
         )
 
+    if issue_sink is not None and first_exception is not None:
+        # Preserve the first rule failure for the legacy exception path, while
+        # the report keeps every failure for the caller.
+        raise first_exception
 
-def verify_all_item_rules(items, links):
+
+def _rule_issue(  # noqa: PLR0913, PLR0917
+    exc, rule, rule_data, source_type, artifacts_queue, path
+):
+    """Build a structured issue from a rule verification failure."""
+    rule_type = rule_data["rule_type"]
+    details = {
+        "rule": list(rule),
+        "source_type": source_type,
+        "rule_type": rule_type,
+        "error": exception_chain(exc),
+    }
+
+    if rule_type == "disallow":
+        # Name the artifacts that the rule rejected.
+        details["artifacts"] = sorted(
+            fnmatch.filter(artifacts_queue, rule_data["pattern"])
+        )
+
+    elif rule_type == "require":
+        details["artifacts"] = [rule_data["pattern"]]
+
+    return make_issue(
+        CATEGORY_RULE_VIOLATION,
+        str(exc),
+        path=path,
+        details=details,
+    )
+
+
+def verify_all_item_rules(items, links, report=None, paths=None):
     """
     <Purpose>
       Iteratively verifies artifact rules of passed items (Steps or Inspections).
@@ -1170,24 +1661,85 @@ def verify_all_item_rules(items, links):
                 ...
               }
 
+      report: (optional)
+              An ItemResult whose nested item results receive the findings. If
+              passed, rule violations do not abort the item or the batch; they
+              are recorded per verified item, so that later items still get an
+              independent result. The first violation is re-raised afterwards
+              to preserve legacy behaviour.
+
+      paths: (optional)
+              A mapping of item name to full report path.
+
     <Exceptions>
-      None.
+      RuleVerificationError and FormatError, as produced by
+      ``verify_item_rules``, if `report` is None (historical behaviour).
 
     <Side Effects>
       None.
 
     """
+    paths = paths or {}
+    first_exception = None
+
     for item in items:
+        item_result = None
+        if report is not None:
+            kind = (
+                "inspection"
+                if item.__class__.__name__ == "Inspection"
+                else "step"
+            )
+            item_result = _find_item(report, item.name)
+            if item_result is None:
+                item_result = report.get_or_add_child(item.name, kind=kind)
+
+        issue_sink = item_result.add_issue if item_result is not None else None
+        path = paths.get(item.name, (item.name,))
+
         LOG.info("Verifying material rules for '%s'...", item.name)
-        verify_item_rules(
-            item.name, "materials", item.expected_materials, links
-        )
+        try:
+            verify_item_rules(
+                item.name,
+                "materials",
+                item.expected_materials,
+                links,
+                issue_sink=issue_sink,
+                path=path,
+            )
+        except (
+            RuleVerificationError,
+            securesystemslib.exceptions.FormatError,
+        ) as exc:
+            if first_exception is None:
+                first_exception = exc
 
         LOG.info("Verifying product rules for '%s'...", item.name)
-        verify_item_rules(item.name, "products", item.expected_products, links)
+        try:
+            verify_item_rules(
+                item.name,
+                "products",
+                item.expected_products,
+                links,
+                issue_sink=issue_sink,
+                path=path,
+            )
+        except (
+            RuleVerificationError,
+            securesystemslib.exceptions.FormatError,
+        ) as exc:
+            if first_exception is None:
+                first_exception = exc
+
+    if first_exception is not None and report is None:
+        # Historical fail-fast behaviour; report-driven callers rely on the
+        # recorded issues instead.
+        raise first_exception
 
 
-def verify_threshold_constraints(layout, chain_link_dict):
+def verify_threshold_constraints(
+    layout, chain_link_dict, report=None, step_paths=None
+):
     """
     <Purpose>
       Verifies that all links corresponding to a given step report the same
@@ -1197,6 +1749,10 @@ def verify_threshold_constraints(layout, chain_link_dict):
       corresponding to a step are valid or created by a different authorized
       functionary. This should be done earlier, using the function
       `verify_link_signature_thresholds`.
+
+      NOTE: Links signed by a master key and by one of its subkeys belong to
+      the same functionary. They are compared like any other pair of links,
+      i.e. contradictory artifact lists are reported for the same signer too.
 
     <Arguments>
       layout:
@@ -1212,17 +1768,28 @@ def verify_threshold_constraints(layout, chain_link_dict):
                 }, ...
               }
 
+      report: (optional)
+              A VerificationReport (or ItemResult for a sublayout). If passed,
+              inconsistencies are recorded per step, naming the conflicting
+              artifact entries, instead of raising on the first conflict.
+
+      step_paths: (optional)
+              A mapping of step name to full report path.
+
     <Exceptions>
       ThresholdVerificationError
           If there are not enough (threshold) links for a steps
 
           If the artifacts for all links of a step are not equal
 
+          Only raised if no `report` is passed.
 
     <Side Effects>
       None.
 
     """
+
+    step_paths = step_paths or {}
 
     # We are only interested in links that are related to steps defined in the
     # Layout, so iterate over layout.steps
@@ -1249,23 +1816,36 @@ def verify_threshold_constraints(layout, chain_link_dict):
         # NOTE: This is already done in `verify_link_signature_thresholds`,
         # Should we remove the check?
         if len(key_link_dict) < step.threshold:
-            raise ThresholdVerificationError(
+            message = (
                 f"Step '{step.name}' not performed by enough functionaries!"
             )
+            if report is None:
+                raise ThresholdVerificationError(message)
+            # Signature threshold verification already reported the concrete
+            # signer deficit for this step. Do not duplicate it, and do not
+            # claim artifact inconsistency when there is nothing to compare.
+            LOG.info(
+                "Skipping artifact constraint verification for step '%s'."
+                " Not enough links were available.",
+                step.name,
+            )
+            continue
 
-        # Take a reference link (e.g. the first in the step_link_dict)
-        reference_keyid = next(iter(key_link_dict.keys()))
+        # Compare all links against a reference link, chosen by sorted keyid
+        # so the reported pair of filenames is deterministic.
+        reference_keyid = min(key_link_dict)
         reference_link = key_link_dict[reference_keyid]
 
         # Iterate over all links to compare their properties with a reference_link
-        for keyid, link in key_link_dict.items():
+        for keyid in sorted(key_link_dict):
+            link = key_link_dict[keyid]
             # TODO: Do we only care for artifacts, or do we want to
             # assert equality of other properties as well?
             if (
                 reference_link.materials != link.materials
                 or reference_link.products != link.products
             ):
-                raise ThresholdVerificationError(
+                message = (
                     "Links '{}' and '{}' have different artifacts!".format(
                         in_toto.models.link.FILENAME_FORMAT.format(
                             step_name=step.name, keyid=reference_keyid
@@ -1275,6 +1855,74 @@ def verify_threshold_constraints(layout, chain_link_dict):
                         ),
                     )
                 )
+                if report is None:
+                    raise ThresholdVerificationError(message)
+
+                deviations = _artifact_deviations(reference_link, link)
+                _add_item_issue(
+                    report,
+                    step.name,
+                    make_issue(
+                        CATEGORY_INCONSISTENT_ARTIFACTS,
+                        message + " Conflicting entries:"
+                        f" {', '.join(_describe_deviations(deviations))}.",
+                        path=step_paths.get(step.name, (step.name,)),
+                        details={
+                            "materials": deviations["materials"],
+                            "products": deviations["products"],
+                            "reference_keyid": reference_keyid,
+                            "conflicting_keyid": keyid,
+                        },
+                    ),
+                )
+
+
+def _artifact_deviations(reference_link, link):
+    """Return artifact paths whose presence or hashes differ between links.
+
+    The result has the form::
+
+        {
+          "materials": {
+            "<path>": {"reference": <hashdict|None>, "conflicting": <hashdict|None>},
+            ...
+          },
+          "products": {...},
+        }
+
+    Entries are determined by path, so an artifact present on only one side is
+    reported with ``None`` on the other side.
+    """
+    deviations = {"materials": {}, "products": {}}
+    for artifact_type in ("materials", "products"):
+        reference_artifacts = getattr(reference_link, artifact_type)
+        conflicting_artifacts = getattr(link, artifact_type)
+        for path in sorted(
+            set(reference_artifacts) | set(conflicting_artifacts)
+        ):
+            reference_hash = reference_artifacts.get(path)
+            conflicting_hash = conflicting_artifacts.get(path)
+            if reference_hash != conflicting_hash:
+                deviations[artifact_type][path] = {
+                    "reference": reference_hash,
+                    "conflicting": conflicting_hash,
+                }
+    return deviations
+
+
+def _describe_deviations(deviations):
+    """Return a deterministic list of human readable deviation strings."""
+    descriptions = []
+    for artifact_type in ("materials", "products"):
+        for path, hashes in deviations[artifact_type].items():
+            if hashes["reference"] is None:
+                kind = "only in conflicting link"
+            elif hashes["conflicting"] is None:
+                kind = "only in reference link"
+            else:
+                kind = "hash mismatch"
+            descriptions.append(f"{artifact_type}:{path} ({kind})")
+    return descriptions
 
 
 def reduce_chain_links(chain_link_dict):
@@ -1314,17 +1962,26 @@ def reduce_chain_links(chain_link_dict):
 
     reduced_chain_link_dict = {}
 
-    for step_name, key_link_dict in chain_link_dict.items():
+    for step_name in sorted(chain_link_dict):
+        key_link_dict = chain_link_dict[step_name]
         # Extract the key_link_dict for this step from the passed chain_link_dict
-        # take one exemplary link (e.g. the first in the step_link_dict)
+        # take one exemplary link, chosen by sorted keyid so the choice does not
+        # depend on dictionary insertion or hash order
         # form the reduced_chain_link_dict to return
-        reduced_chain_link_dict[step_name] = next(iter(key_link_dict.values()))
+        reduced_chain_link_dict[step_name] = key_link_dict[min(key_link_dict)]
 
     return reduced_chain_link_dict
 
 
-def verify_sublayouts(
-    layout, steps_metadata, superlayout_link_dir_path, inspect_timeout
+def verify_sublayouts(  # noqa: C901, PLR0913, PLR0917
+    layout,
+    steps_metadata,
+    superlayout_link_dir_path,
+    inspect_timeout,
+    report=None,
+    step_paths=None,
+    step_order=None,
+    verify_sublayout=None,
 ):
     """
     <Purpose>
@@ -1358,11 +2015,27 @@ def verify_sublayouts(
               Integer value that is the number of seconds to pass to the run
               command to timeout the subprocess within.
 
-    <Exceptions>
-      raises an Exception if verification of the delegated step fails.
+      report: (optional)
+              An ItemResult whose nested item results receive sublayout
+              findings. Nested failures carry the complete outer step path.
 
-    <Side Effects>
-      None.
+      step_paths: (optional)
+              A mapping of step name to full report path.
+
+      step_order: (optional)
+              Step names in dependency order. Sublayouts are verified in this
+              order, so the order never depends on dictionary order.
+
+      verify_sublayout: (optional)
+              Callable ``(metadata, layout_key_dict, step_name, link_dir_path,
+              step_path, report_item) -> Link`` used for the recursive
+              verification. Defaults to ``in_toto_verify`` without a report,
+              i.e. the historical behaviour.
+
+    <Exceptions>
+      raises an Exception if verification of the delegated step fails. If a
+      `report` is passed, sublayout failures are recorded instead and the
+      remaining steps are still verified.
 
     <Returns>
       The passed dictionary containing Link objects instead of metadata per
@@ -1377,11 +2050,31 @@ def verify_sublayouts(
 
     """
     chain_link_dict = {}
+    step_paths = step_paths or {}
 
-    for step_name, metadata_dict in steps_metadata.items():
+    for step_name in step_order or sorted(steps_metadata):
+        metadata_dict = steps_metadata[step_name]
+        # Steps whose metadata was loaded are always reported, even when there
+        # is none, so a step can never silently disappear from a report.
+        if report is not None:
+            _sublayout_parent_item(
+                report,
+                step_name,
+                step_paths.get(step_name, (step_name,)),
+            )
         key_link_dict = {}
-        for keyid, metadata in metadata_dict.items():
-            payload = metadata.get_payload()
+        for keyid in sorted(metadata_dict):
+            metadata = metadata_dict[keyid]
+            try:
+                payload = metadata.get_payload()
+            except Exception:  # noqa: BLE001
+                # Malformed metadata was recorded during loading.
+                LOG.info(
+                    "Skipping unparseable metadata for step '%s' (keyid '%s').",
+                    step_name,
+                    keyid,
+                )
+                continue
 
             if payload.type_ == "layout":
                 LOG.info("Verifying sublayout %s...", step_name)
@@ -1405,15 +2098,53 @@ def verify_sublayouts(
                     superlayout_link_dir_path, sub_link_dir
                 )
 
-                # Make a recursive call to in_toto_verify with the
-                # layout and the extracted key object
-                summary_link = in_toto_verify(
-                    metadata,
-                    layout_key_dict,
-                    link_dir_path=sublayout_link_dir_path,
-                    step_name=step_name,
-                    inspect_timeout=inspect_timeout,
-                )
+                path = step_paths.get(step_name, (step_name,))
+
+                try:
+                    if verify_sublayout is None:
+                        summary_link = in_toto_verify(
+                            metadata,
+                            layout_key_dict,
+                            link_dir_path=sublayout_link_dir_path,
+                            step_name=step_name,
+                            inspect_timeout=inspect_timeout,
+                        )
+                    else:
+                        summary_link = verify_sublayout(
+                            metadata,
+                            layout_key_dict,
+                            step_name,
+                            sublayout_link_dir_path,
+                            path,
+                            report,
+                        )
+                except LayoutReferenceError:
+                    # Malformed references in a delegated layout are layout
+                    # errors, not verification findings: they abort verification
+                    # the same way they do for the root layout.
+                    raise
+                except Exception as exc:
+                    if report is None:
+                        raise
+                    # Record the failure with the outer step path and continue
+                    # with the remaining delegates of this step.
+                    nested = _sublayout_parent_item(report, step_name, path)
+                    if not any(
+                        issue.category == CATEGORY_SUBLAYOUT_FAILURE
+                        for issue in nested.issues
+                    ):
+                        nested.add_issue(
+                            make_issue(
+                                CATEGORY_SUBLAYOUT_FAILURE,
+                                f"Sublayout verification for step"
+                                f" '{step_name}' failed: {exc}",
+                                path=path,
+                                details={"error": exception_chain(exc)},
+                            )
+                        )
+                    payload = in_toto.models.link.Link(name=step_name)
+                    key_link_dict[keyid] = payload
+                    continue
 
                 # Replace the layout object with the link object returned
                 # by in-toto-verify
@@ -1423,6 +2154,46 @@ def verify_sublayouts(
         chain_link_dict[step_name] = key_link_dict
 
     return chain_link_dict
+
+
+def _sublayout_parent_item(report, step_name, path, kind="step"):
+    """Return (and create if needed) the report item for a delegated step."""
+    if isinstance(report, VerificationReport):
+        item = _find_item(report, step_name)
+        if item is None:
+            item = ItemResult(name=step_name, path=path, kind=kind)
+            report.steps.append(item)
+        return item
+
+    if isinstance(report, ItemResult):
+        item = _find_item(report, step_name)
+        if item is None:
+            item = ItemResult(name=step_name, path=path)
+            report.sub_reports.append(item)
+        return item
+
+    return None  # pragma: no cover (caller guarantees a report)
+
+
+def merge_sublayout_report(parent_item, nested_report):
+    """Attach a nested layout report to its delegating step item.
+
+    Nested step results are kept as sub-reports, so their failures remain
+    attributable to inner steps while also carrying the full outer path.
+    Layout-level findings of the nested layout (e.g. a bad signature on the
+    delegated layout) are attached to the delegating step.
+    """
+    parent_item.sub_reports.extend(nested_report.steps)
+    parent_item.sub_reports.extend(nested_report.inspections)
+    for issue in nested_report.issues:
+        # Layout-level findings of the nested layout (e.g. a bad signature on
+        # the delegated layout, or an expired sublayout) belong to the step
+        # that delegated. They already carry the full path from the root.
+        parent_item.add_issue(issue)
+
+    # The parent's final status is derived by ItemResult.finalize from our
+    # issues and nested reports, so no status is pinned here on purpose.
+    return parent_item
 
 
 def get_summary_link(layout, reduced_chain_link_dict, name):
@@ -1489,6 +2260,8 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     step_name="",
     persist_inspection_links=True,
     inspect_timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
+    report=None,
+    _step_path=(),
 ):
     """Performs complete in-toto supply chain verification for a final product.
 
@@ -1496,19 +2269,28 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     the given order:
 
     1.  Verify layout signatures
-    2.  Verify layout expiration date
-    3.  Substitute placeholders in the layout
-    4.  Load link metadata
-    5.  Verify link signatures with keys in layout
-    6.  Recurse into sublayout verification
-    7.  Soft-verify alignment of reported and expected commands. Note:
+    2.  Validate step references and derive dependency order
+    3.  Verify layout expiration date
+    4.  Substitute placeholders in the layout
+    5.  Load link metadata
+    6.  Verify link signatures with keys in layout
+    7.  Recurse into sublayout verification
+    8.  Soft-verify alignment of reported and expected commands. Note:
         verification does not fail if commands don't match, instead a warning is
         logged as per the in-toto specification --
         https://github.com/in-toto/docs/blob/master/in-toto-spec.md#431-steps
-    8.  Verify threshold artifact constraints
-    9.  Process step product and material rules
-    10. Execute inspection commands and generate inspection links
-    11. Process inspection product and material rules
+    9.  Verify threshold artifact constraints
+    10. Process step product and material rules
+    11. Execute inspection commands and generate inspection links
+    12. Process inspection product and material rules
+
+    Without a ``report`` argument, verification stops at the first failed check
+    and raises, exactly like before. With a ``report`` argument, every step and
+    inspection is verified independently, all failures are attributed to the
+    item and check that produced them, and the report is filled in even if
+    verification fails. In that mode this function returns the summary link and
+    stores it on the report (`report.summary_link`), rather than raising for
+    ordinary verification failures.
 
     Note: in-toto's verification workflow directly uses the key for verifying
     signatures. It does not communicate with external sources of information for
@@ -1547,8 +2329,20 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
           in_toto.settings.LINK_CMD_EXEC_TIMEOUT in seconds which ends up timing
           out the run command subprocess if it runs over.
 
+      report (optional): A ``VerificationReport`` to fill in. If passed, the
+          return type is unchanged (the summary link), but the report receives
+          per-item results, signer counts and attributed issues, and ordinary
+          verification failures are no longer raised. Pass
+          ``report.summary_link`` to retrieve the summary link.
+
+      _step_path (internal): Full report path prefix used during recursion into
+          sublayouts. Not part of the public API.
+
     Raises:
       securesystemslib.exceptions.FormatError: Passed parameters are malformed.
+
+      LayoutReferenceError: A rule references a nonexistent step, or step
+          references form a cycle. Raised before any verification work starts.
 
       SignatureVerificationError: No layout verification key is passed, or any of
           the passed keys fails to verify a signature.
@@ -1579,6 +2373,18 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
       verification.
 
     """
+    if report is not None:
+        return _in_toto_verify_reporting(
+            metadata,
+            layout_key_dict,
+            link_dir_path,
+            substitution_parameters,
+            step_name,
+            persist_inspection_links,
+            inspect_timeout,
+            report,
+            _step_path,
+        )
 
     LOG.info("Verifying layout metadata signatures...")
     verify_metadata_signatures(metadata, layout_key_dict)
@@ -1588,6 +2394,9 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     # container (Metablock) that also carries the signatures
     LOG.info("Extracting layout from metadata...")
     layout = metadata.get_payload()
+
+    LOG.info("Validating step references...")
+    verify_step_order(layout)
 
     LOG.info("Verifying layout expiration...")
     verify_layout_expiration(layout)
@@ -1640,3 +2449,407 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     # This is mostly relevant if the currently verified supply chain is embedded
     # in another supply chain
     return get_summary_link(layout, reduced_chain_link_dict, step_name)
+
+
+def _in_toto_verify_reporting(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
+    metadata,
+    layout_key_dict,
+    link_dir_path,
+    substitution_parameters,
+    step_name,
+    persist_inspection_links,
+    inspect_timeout,
+    report,
+    step_path,
+):
+    """Report-driven verification. See ``in_toto_verify`` for the contract.
+
+    Checks that can be evaluated without metadata (layout signature,
+    references, expiration) are layout-level. Every step and inspection
+    otherwise gets its own result; a failure in one never prevents the others
+    from being checked.
+    """
+    # 1. Layout-level checks. These are recorded, but verification continues so
+    # that the report is as complete as possible. A bad layout signature still
+    # makes the overall verdict fail.
+    try:
+        verify_metadata_signatures(metadata, layout_key_dict)
+    except Exception as exc:  # noqa: BLE001
+        report.add_issue(
+            make_issue(
+                CATEGORY_LAYOUT_SIGNATURE,
+                f"Layout signature verification failed: {exc}",
+                path=step_path,
+                details={"error": exception_chain(exc)},
+            )
+        )
+
+    try:
+        layout = metadata.get_payload()
+    except Exception as exc:  # noqa: BLE001
+        # Without a payload nothing else can be verified.
+        report.add_issue(
+            make_issue(
+                CATEGORY_LAYOUT_SIGNATURE,
+                f"Could not extract layout payload: {exc}",
+                path=step_path,
+                details={"error": exception_chain(exc)},
+            )
+        )
+        report.complete = False
+        report.finalize()
+        return None
+
+    # 2. Validate references and derive deterministic dependency order before
+    # any files are read. Malformed references abort verification by design.
+    step_order = _validate_step_references(layout)
+    ordered_names = _topological_order(step_order)
+    report.ordered_step_names = list(ordered_names)
+    step_paths = {
+        name: (*step_path, name) for name in layout.get_step_name_list()
+    }
+
+    try:
+        verify_layout_expiration(layout)
+    except Exception as exc:  # noqa: BLE001
+        report.add_issue(
+            make_issue(
+                CATEGORY_LAYOUT_EXPIRED,
+                f"Layout expired: {exc}",
+                path=step_path,
+                details={"error": exception_chain(exc)},
+            )
+        )
+
+    if substitution_parameters is not None:
+        LOG.info("Performing parameter substitution...")
+        substitute_parameters(layout, substitution_parameters)
+
+    # Create a result per step up front, in dependency order, so every step
+    # gets a conclusion even if loading or verification fails early. When the
+    # parent already created a placeholder (it does so before recursing into
+    # a delegated layout), reuse it instead of duplicating the step.
+    item_by_name = {}
+    for name in ordered_names:
+        item = _find_item(report, name)
+        if item is None:
+            item = ItemResult(name=name, path=step_paths[name], kind="step")
+            report.steps.append(item)
+        item.threshold = layout.get_step_by_name(name).threshold
+        item_by_name[name] = item
+
+    # Create inspection results up front too, so they appear in the report even
+    # if step verification fails and the commands are never executed.
+    inspection_results = {}
+    for inspection in layout.inspect:
+        item = ItemResult(
+            name=inspection.name,
+            path=(*step_path, inspection.name),
+            kind="inspection",
+        )
+        report.inspections.append(item)
+        inspection_results[inspection.name] = item
+
+    # 3. Load metadata. Unparseable files are skipped and recorded; missing
+    # metadata is recorded but does not abort.
+    LOG.info("Reading link metadata files...")
+    steps_metadata = load_links_for_layout(
+        layout,
+        link_dir_path,
+        report=report,
+        step_paths=step_paths,
+        raise_on_missing=False,
+    )
+
+    # 4. Signature threshold verification, attributed per step.
+    LOG.info("Verifying link metadata signatures...")
+    steps_metadata = verify_link_signature_thresholds(
+        layout, steps_metadata, report=report, step_paths=step_paths
+    )
+
+    # 5. Sublayout recursion. Nested results carry the full outer step path.
+    LOG.info("Verifying sublayouts...")
+
+    def verify_nested(
+        nested_metadata, nested_key_dict, name, link_dir, path, _report
+    ):
+        nested_report = VerificationReport()
+        try:
+            nested_link = in_toto_verify(
+                nested_metadata,
+                nested_key_dict,
+                link_dir_path=link_dir,
+                step_name=name,
+                inspect_timeout=inspect_timeout,
+                report=nested_report,
+                _step_path=path,
+            )
+        except Exception:
+            # Preserve whatever the nested layout completed before the
+            # interruption, then let the caller handle the failure.
+            parent = _sublayout_parent_item(report, name, path)
+            merge_sublayout_report(parent, nested_report)
+            raise
+        parent = _sublayout_parent_item(report, name, path)
+        merge_sublayout_report(parent, nested_report)
+        # A sublayout that could not even be parsed yields no summary link.
+        # Return an empty placeholder so the caller can still attribute the
+        # failure to this step instead of crashing on a missing link.
+        return nested_link or in_toto.models.link.Link(name=name)
+
+    chain_link_dict = verify_sublayouts(
+        layout,
+        steps_metadata,
+        link_dir_path,
+        inspect_timeout,
+        report=report,
+        step_paths=step_paths,
+        step_order=ordered_names,
+        verify_sublayout=verify_nested,
+    )
+
+    # 6. Command alignment is a soft check: record a warning, never fail.
+    LOG.info("Verifying alignment of reported commands...")
+    for step in layout.steps:
+        item = item_by_name[step.name]
+        for keyid in sorted(chain_link_dict.get(step.name, {})):
+            link = chain_link_dict[step.name][keyid]
+            if link.command != step.expected_command:
+                message = (
+                    f"Run command '{link.command}' differs from expected"
+                    f" command '{step.expected_command}'"
+                )
+                LOG.warning("%s", message)
+                item.add_issue(
+                    make_issue(
+                        CATEGORY_COMMAND_MISMATCH,
+                        message,
+                        path=step_paths[step.name],
+                        severity=SEVERITY_WARNING,
+                        details={"keyid": keyid},
+                    )
+                )
+
+    # 7. Threshold artifact constraints (contradicting artifacts per step).
+    LOG.info("Verifying threshold constraints...")
+    verify_threshold_constraints(
+        layout, chain_link_dict, report=report, step_paths=step_paths
+    )
+
+    # Only steps whose evidence is trustworthy may provide artifact evidence
+    # to other steps. A step whose links could not be authenticated (signature
+    # threshold, signature failure, unreadable metadata, failed delegated
+    # layout) is excluded, so a downstream step cannot "pass" on untrusted
+    # input. Its own result still reflects the violations it did produce.
+    trustworthy_links = {}
+    for name in ordered_names:
+        if _has_trust_failure(item_by_name[name]):
+            continue
+        key_link_dict = chain_link_dict.get(name, {})
+        if key_link_dict:
+            trustworthy_links[name] = key_link_dict[min(key_link_dict)]
+    reduced_chain_link_dict = trustworthy_links
+
+    # 8. Step rules, in dependency order. A step's rules are only evaluated if
+    # its evidence is authenticated and all steps it references provide usable
+    # evidence; otherwise the step is undetermined rather than passed.
+    LOG.info("Verifying Step rules...")
+    for name in ordered_names:
+        item = item_by_name[name]
+        step = layout.get_step_by_name(name)
+        missing_dependencies = sorted(
+            dependency
+            for dependency in _iter_step_dependency_names(step, layout)
+            if dependency not in trustworthy_links
+        )
+        if name not in trustworthy_links:
+            item.add_issue(
+                make_issue(
+                    CATEGORY_RULE_EVALUATION_ERROR,
+                    "Artifact rules could not be evaluated because this step's"
+                    " evidence is not trustworthy.",
+                    path=step_paths[name],
+                    severity=SEVERITY_UNDETERMINED,
+                )
+            )
+            continue
+        if missing_dependencies:
+            item.add_issue(
+                make_issue(
+                    CATEGORY_RULE_EVALUATION_ERROR,
+                    "Artifact rules could not be fully evaluated because"
+                    " referenced step(s) do not provide trustworthy evidence:"
+                    f" {', '.join(missing_dependencies)}.",
+                    path=step_paths[name],
+                    severity=SEVERITY_UNDETERMINED,
+                    details={"untrusted_dependencies": missing_dependencies},
+                )
+            )
+            continue
+
+        # A single-item report scope receives all findings of this step only.
+        try:
+            verify_all_item_rules(
+                [step],
+                reduced_chain_link_dict,
+                report=_item_report_scope(item),
+                paths=step_paths,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not any(
+                issue.category
+                in {CATEGORY_RULE_VIOLATION, CATEGORY_RULE_EVALUATION_ERROR}
+                for issue in item.issues
+            ):
+                item.add_issue(
+                    make_issue(
+                        CATEGORY_RULE_EVALUATION_ERROR,
+                        f"Could not evaluate artifact rules: {exc}",
+                        path=step_paths[name],
+                        severity=SEVERITY_UNDETERMINED,
+                        details={"error": exception_chain(exc)},
+                    )
+                )
+
+    # 9. Inspections. They run after all steps; a failing inspection does not
+    # prevent the remaining inspections from running.
+    LOG.info("Executing Inspection commands...")
+    inspection_links = {}
+    for inspection in layout.inspect:
+        item = inspection_results[inspection.name]
+
+        if report.has_error():
+            # Do not run inspection commands on input that already failed
+            # verification. The inspection stays undetermined, not passed.
+            item.add_issue(
+                make_issue(
+                    CATEGORY_INSPECTION_SKIPPED,
+                    "Inspection was not executed because step verification"
+                    " failed.",
+                    path=item.path,
+                    severity=SEVERITY_UNDETERMINED,
+                )
+            )
+            continue
+
+        try:
+            inspection_links.update(
+                run_all_inspections(
+                    _SingleInspectionLayout(inspection),
+                    persist_inspection_links,
+                    inspect_timeout,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            item.add_issue(
+                make_issue(
+                    CATEGORY_INSPECTION_FAILURE,
+                    f"Inspection command failed: {exc}",
+                    path=item.path,
+                    details={"error": exception_chain(exc)},
+                )
+            )
+
+    LOG.info("Verifying Inspection rules...")
+    combined_links = reduced_chain_link_dict.copy()
+    combined_links.update(inspection_links)
+    for inspection in layout.inspect:
+        item = inspection_results[inspection.name]
+        if inspection.name not in inspection_links:
+            continue
+        try:
+            verify_all_item_rules(
+                [inspection],
+                combined_links,
+                report=_item_report_scope(item),
+                paths={inspection.name: item.path},
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not any(
+                issue.category
+                in {CATEGORY_RULE_VIOLATION, CATEGORY_RULE_EVALUATION_ERROR}
+                for issue in item.issues
+            ):
+                item.add_issue(
+                    make_issue(
+                        CATEGORY_RULE_EVALUATION_ERROR,
+                        f"Could not evaluate artifact rules: {exc}",
+                        path=item.path,
+                        severity=SEVERITY_UNDETERMINED,
+                        details={"error": exception_chain(exc)},
+                    )
+                )
+
+    report.complete = True
+    report.finalize()
+
+    if report.passed:
+        LOG.info("The software product passed all verification.")
+    else:
+        LOG.info("Verification did not pass. See the verification report.")
+
+    summary_link = None
+    if all(step.name in reduced_chain_link_dict for step in layout.steps):
+        summary_link = get_summary_link(
+            layout, reduced_chain_link_dict, step_name
+        )
+    report.summary_link = summary_link
+    return summary_link
+
+
+class _SingleInspectionLayout:
+    """Minimal layout proxy exposing exactly one inspection.
+
+    ``run_all_inspections`` only reads ``layout.inspect`` and resets the global
+    artifact base path per inspection; running one inspection at a time lets us
+    attribute command failures to the inspection that produced them.
+    """
+
+    def __init__(self, inspection):
+        self.inspect = [inspection]
+
+
+def verify_layout_report(  # noqa: PLR0913, PLR0917
+    metadata,
+    layout_key_dict,
+    link_dir_path=".",
+    substitution_parameters=None,
+    step_name="",
+    persist_inspection_links=True,
+    inspect_timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
+):
+    """Verify a supply chain and return a complete, deterministic report.
+
+    This is the report-driven counterpart of :func:`in_toto_verify`. Every
+    step and inspection gets its own conclusion, including signer counts and
+    attributed reasons for failure; a failure never prevents later steps from
+    being verified.
+
+    Malformed step references and dependency cycles are rejected before any
+    verification work starts and are raised as ``LayoutReferenceError``; they
+    are layout errors, not verification outcomes. Every other finding is part
+    of the returned report.
+
+    Arguments: See :func:`in_toto_verify`. ``report`` and private arguments are
+    not accepted here.
+
+    Raises:
+      LayoutReferenceError: A rule references a nonexistent step, or step
+          references form a cycle.
+
+    Returns:
+      A ``VerificationReport``. Its ``summary_link`` attribute holds the summary
+      link that ``in_toto_verify`` would return, when one could be built.
+    """
+    report = VerificationReport()
+    in_toto_verify(
+        metadata,
+        layout_key_dict,
+        link_dir_path=link_dir_path,
+        substitution_parameters=substitution_parameters,
+        step_name=step_name,
+        persist_inspection_links=persist_inspection_links,
+        inspect_timeout=inspect_timeout,
+        report=report,
+    )
+    return report

@@ -3,7 +3,7 @@
 
 # TODO: Add module docstring and remove pylint exemption in in-toto/in-toto#126
 # pylint: disable=missing-docstring
-from securesystemslib.exceptions import Error
+from securesystemslib.exceptions import Error, FormatError
 
 
 class SignatureVerificationError(Error):
@@ -41,3 +41,19 @@ class PrefixError(Error):
 
 class InvalidMetadata(Error):  # noqa: N818
     """Indicates that the metadata is not valid."""
+
+
+class LayoutReferenceError(FormatError):
+    """Indicates that a layout's step references are malformed.
+
+    Raised before verification starts if a rule references a step that does
+    not exist in the layout, or if step references form a dependency cycle.
+    Inherits from ``securesystemslib.exceptions.FormatError`` so callers that
+    already treat malformed layouts as format errors keep working.
+    """
+
+    def __init__(self, message, step=None, reference=None, cycle=None):
+        super().__init__(message)
+        self.step = step
+        self.reference = reference
+        self.cycle = tuple(cycle) if cycle else None

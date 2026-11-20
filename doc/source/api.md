@@ -41,3 +41,29 @@ documented [in-toto#663](https://github.com/in-toto/in-toto/issues/663).
 ```{eval-rst}
 .. autofunction:: in_toto.verifylib.in_toto_verify
 ```
+
+### Structured verification reports
+
+`verify_layout_report` runs the same verification as `in_toto_verify`, but
+returns a `VerificationReport` instead of raising on the first failed check.
+Every step and inspection gets its own conclusion, including the number of
+distinct authorized signers that were satisfied and are still missing.
+
+```{eval-rst}
+.. autofunction:: in_toto.verifylib.verify_layout_report
+```
+
+```{eval-rst}
+.. autoclass:: in_toto.verify_report.VerificationReport
+   :members:
+```
+
+```{eval-rst}
+.. autoclass:: in_toto.verify_report.ItemResult
+   :members:
+```
+
+```{eval-rst}
+.. autoclass:: in_toto.verify_report.VerificationIssue
+   :members:
+```

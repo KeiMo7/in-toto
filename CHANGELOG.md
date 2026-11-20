@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+* Structured, deterministic verification reports via
+  `verifylib.verify_layout_report` and the new `in_toto.verify_report` module.
+  Every step and inspection gets an independent conclusion, including the
+  number of distinct authorized signers that were satisfied and are still
+  missing. Missing or unparseable metadata, insufficient signers, artifact
+  inconsistencies and rule violations are attributed to the step and check
+  that produced them, including the full path for steps inside delegated
+  layouts.
+* Step verification order is derived from artifact (`MATCH`) dependencies with
+  a deterministic tie-break, independent of layout, directory or hash order.
+* `verifylib.verify_step_order` and layout reference validation, which reject
+  dangling references and dependency cycles before verification starts with
+  `exceptions.LayoutReferenceError` (a `FormatError` subclass that names the
+  offending rule and, for cycles, the steps on the cycle).
+
+### Changed
+* Threshold verification counts a master key and all of its subkeys as a single
+  signer, including in the new report's satisfied/missing signer counts.
+* `in_toto_verify` accepts an optional `report` argument; without it, behavior,
+  return value and exception types are unchanged.
+
 ## v3.1.0
 
 This release includes version bumpbs, as well as upgraded debian support , and
