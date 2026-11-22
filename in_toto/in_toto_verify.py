@@ -22,6 +22,11 @@
   1 if an exception occurred (verification failed)
   0 if no exception occurred (verification passed)
 
+  With ``--allow-partial`` a chain that regular verification rejects but
+  diagnosis classifies as only partially verified exits with
+  ``--partial-exit-code`` (default 3). Regular verification still decides
+  pass/fail; partial acceptance is opt-in.
+
 """
 
 import argparse
@@ -30,7 +35,7 @@ import sys
 
 from securesystemslib._gpg import functions as gpg_interface
 
-from in_toto import __version__, verifylib
+from in_toto import __version__, proofchain, verifylib
 from in_toto.common_args import (
     GPG_HOME_ARGS,
     GPG_HOME_KWARGS,
@@ -186,6 +191,72 @@ for which the public part can be found in the GPG keyring at '~/.gnupg'.
         ),
     )
 
+    diagnosis_args = parser.add_argument_group(
+        "provenance diagnosis (optional)"
+    )
+    diagnosis_args.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "run breakpoint diagnosis in addition to verification and print"
+            " a per-layer report. Diagnosis never changes the verification"
+            " result: the command still exits 1 if regular verification fails."
+        ),
+    )
+    diagnosis_args.add_argument(
+        "--diagnose-format",
+        choices=["text", "json"],
+        default="text",
+        help=(
+            "output format for --diagnose (default: text). 'json' is"
+            " machine-readable and includes expected proof types and "
+            "remediation hints."
+        ),
+    )
+    diagnosis_args.add_argument(
+        "--diagnose-report",
+        metavar="<path>",
+        help=("write the --diagnose report to this path instead of stdout."),
+    )
+    diagnosis_args.add_argument(
+        "--proof-store",
+        metavar="<dir>",
+        help=(
+            "directory of an independent proof store to consult for proofs that"
+            " are not bundled with the artifact. Proofs are read as"
+            " '<layer id>.json'."
+        ),
+    )
+    diagnosis_args.add_argument(
+        "--artifact-base-path",
+        metavar="<path>",
+        help=(
+            "directory against which --diagnose checks declared product hashes"
+            " to detect validly signed but tampered content."
+        ),
+    )
+    diagnosis_args.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=(
+            "tolerant mode: let a chain with verified layers but missing,"
+            " unreachable, pending or unverifiable layers pass with a"
+            " 'partially verified' verdict. Never accepts an invalid or"
+            " tampered proof. Implies --diagnose."
+        ),
+    )
+    diagnosis_args.add_argument(
+        "--partial-exit-code",
+        type=int,
+        default=3,
+        metavar="<int>",
+        help=(
+            "exit code used with --allow-partial when the chain is only"
+            " partially verified (default: 3). Full verification still exits"
+            " 0 and rejection still exits 1."
+        ),
+    )
+
     verbosity_args = parser.add_mutually_exclusive_group(required=False)
     verbosity_args.add_argument(*VERBOSE_ARGS, **VERBOSE_KWARGS)
     verbosity_args.add_argument(*QUIET_ARGS, **QUIET_KWARGS)
@@ -217,6 +288,13 @@ def main():
             " '--verification-keys path [path ...]' and/or '--gpg id [id ...]'."
         )
 
+    if args.allow_partial and not args.diagnose:
+        args.diagnose = True
+
+    layout = None
+    layout_key_dict = None
+    verification_error = None
+
     try:
         LOG.info("Loading layout...")
         layout = Metadata.load(args.layout)
@@ -241,7 +319,64 @@ def main():
         )
 
     except Exception as e:  # noqa: BLE001
+        verification_error = e
         LOG.error("(in-toto-verify) %s: %s", type(e).__name__, e)
+
+    diagnosis = None
+    if args.diagnose and layout is not None and layout_key_dict is not None:
+        diagnosis = _run_diagnosis(args, layout, layout_key_dict)
+
+    if verification_error is not None:
+        if (
+            diagnosis is not None
+            and args.allow_partial
+            and diagnosis.verdict is proofchain.ChainVerdict.PARTIALLY_VERIFIED
+            and diagnosis.is_acceptable()
+        ):
+            LOG.warning(
+                "Provenance chain is only PARTIALLY verified (confidence %s)."
+                " Regular verification still fails; tolerant mode does not"
+                " turn a verification failure into a pass.",
+                diagnosis.confidence.value,
+            )
+            sys.exit(args.partial_exit_code)
+
         sys.exit(1)
 
     sys.exit(0)
+
+
+def _run_diagnosis(args, layout, layout_key_dict):
+    """Run provenance diagnosis and emit its report.
+
+    Diagnosis is strictly read-only with respect to the verification result.
+    """
+    proof_store = (
+        proofchain.FileProofStore(args.proof_store)
+        if args.proof_store
+        else None
+    )
+
+    diagnosis = proofchain.diagnose_provenance_chain(
+        layout,
+        layout_key_dict,
+        link_dir_path=args.link_dir,
+        proof_store=proof_store,
+        artifact_base_path=args.artifact_base_path,
+        tolerant=args.allow_partial,
+    )
+
+    report = (
+        diagnosis.to_json()
+        if args.diagnose_format == "json"
+        else diagnosis.render()
+    )
+
+    if args.diagnose_report:
+        with open(args.diagnose_report, "w", encoding="utf8") as fp:
+            fp.write(report)
+            fp.write("\n")
+    else:
+        print(report)
+
+    return diagnosis

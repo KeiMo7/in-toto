@@ -41,3 +41,20 @@ class PrefixError(Error):
 
 class InvalidMetadata(Error):  # noqa: N818
     """Indicates that the metadata is not valid."""
+
+
+class ProofStoreError(Error):
+    """Base class for errors raised while fetching provenance proofs."""
+
+
+class ProofStoreUnavailable(ProofStoreError):
+    """Indicates that a proof store could not be reached.
+
+    This is a transient/degraded condition and must not be confused with a
+    proof that is absent from a reachable store. Callers are expected to retry
+    before drawing conclusions about the proof itself.
+    """
+
+
+class ProofStoreTimeout(ProofStoreUnavailable):
+    """Indicates that fetching a proof from a store timed out."""

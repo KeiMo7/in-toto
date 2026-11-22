@@ -19,6 +19,7 @@
 
 """
 
+import json
 import os
 import shutil
 import unittest
@@ -252,3 +253,109 @@ class TestInTotoVerifySubjectPublicKeyInfoKeysAndUseDSSE(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInTotoVerifyDiagnosis(CliTestCase, TmpDirMixin):
+    """Tests the provenance diagnosis options of in-toto-verify.
+
+    These tests assert that diagnosis is additive: it never changes the
+    regular pass/fail decision, and partial acceptance is opt-in only.
+    """
+
+    cli_main_func = staticmethod(in_toto_verify_main)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.set_up_test_dir()
+
+        for demo_file in [
+            "foo.tar.gz",
+            "package.2f89b927.link",
+            "write-code.776a00e2.link",
+        ]:
+            shutil.copy(DEMO_FILES / demo_file, demo_file)
+
+        shutil.copytree(SCRIPTS, "scripts")
+
+        layout_template = Metadata.load(
+            str(DEMO_FILES / "demo.layout.template")
+        )
+        cls.signer = load_crypto_signer_from_pkcs8_file(
+            PEMS / "rsa_private_unencrypted.pem"
+        )
+        layout_template.create_signature(cls.signer)
+        layout_template.dump("demo.layout")
+        cls.public_key_paths = [str(PEMS / "rsa_public.pem")]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tear_down_test_dir()
+
+    def _args(self, *extra):
+        return (
+            [
+                "--layout",
+                "demo.layout",
+                "--verification-keys",
+            ]
+            + self.public_key_paths
+            + list(extra)
+        )
+
+    def test_diagnose_does_not_change_passing_verification(self):
+        self.assert_cli_sys_exit(self._args("--diagnose"), 0)
+
+    def test_diagnose_missing_link_still_exits_one(self):
+        os.rename("package.2f89b927.link", "package.link.bak")
+        try:
+            self.assert_cli_sys_exit(self._args("--diagnose"), 1)
+        finally:
+            os.rename("package.link.bak", "package.2f89b927.link")
+
+    def test_diagnose_json_report_file(self):
+        report_path = os.path.join(os.getcwd(), "diagnosis.json")
+        self.assert_cli_sys_exit(
+            self._args(
+                "--diagnose",
+                "--diagnose-format",
+                "json",
+                "--diagnose-report",
+                report_path,
+            ),
+            0,
+        )
+        with open(report_path, encoding="utf8") as fp:
+            report = json.load(fp)
+        self.assertEqual(report["verdict"], "verified")
+        self.assertEqual(report["layers"][0]["status"], "verified")
+        os.remove(report_path)
+
+    def test_allow_partial_returns_partial_exit_code(self):
+        os.rename("package.2f89b927.link", "package.link.bak")
+        try:
+            # Without tolerant mode the command fails as usual.
+            self.assert_cli_sys_exit(self._args("--diagnose"), 1)
+
+            # With tolerant mode regular verification still fails, but the
+            # partial verdict is signalled with a distinct exit code.
+            self.assert_cli_sys_exit(
+                self._args("--allow-partial", "--partial-exit-code", "7"), 7
+            )
+        finally:
+            os.rename("package.link.bak", "package.2f89b927.link")
+
+    def test_allow_partial_still_rejects_invalid_proof(self):
+        # Corrupt the product of the 'write-code' layer: signature no longer
+        # verifies, which tolerant mode must never accept.
+        link = Metadata.load("write-code.776a00e2.link")
+        link.signed.products = {"foo.py": {"sha256": "0" * 64}}
+        link.signatures = []
+        link.create_signature(self.signer)
+        # Re-sign with the right key but change content afterwards.
+        link.signed.products = {"foo.py": {"sha256": "1" * 64}}
+        link.dump("write-code.776a00e2.link")
+
+        # Regular verification fails, and tolerant mode must not rescue it.
+        self.assert_cli_sys_exit(
+            self._args("--allow-partial", "--partial-exit-code", "7"), 1
+        )

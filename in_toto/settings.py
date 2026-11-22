@@ -41,3 +41,13 @@ ARTIFACT_BASE_PATH = None
 
 # Max timeout for the in-toto-run command
 LINK_CMD_EXEC_TIMEOUT = 10
+
+# Highest provenance proof format version understood by the diagnostics engine.
+# Proofs that declare a higher version are reported as "unverifiable" with an
+# explicit upgrade recommendation, rather than as corrupt.
+PROVENANCE_MAX_FORMAT_VERSION = 1
+
+# Default for whether partial provenance verification may be accepted. This is
+# only a default for callers that do not pass the option explicitly; the
+# regular verification workflow always stays fail-closed.
+PROVENANCE_TOLERANT_MODE = False
